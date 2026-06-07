@@ -1,0 +1,9 @@
+# generated files
+checkpoints/
+data/
+generated/
+**/__pycache__/
+
+# vs code specific
+.vscode
+.DS_Store
