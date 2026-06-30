@@ -20,9 +20,6 @@ DEFAULT_GENERATED_DIR = PROJECT_ROOT / "generated" / "diffusion"
 
 
 def find_checkpoint(checkpoint_dir: Path) -> Path:
-    if True:
-        return Path("/Users/antonspannagl/PythonProjects/BPM_Chaos/checkpoints/diffusion/diffusion-epoch=08-val_loss=0.0118.ckpt")
-
     # Prefer the latest checkpoint, then fall back to the newest checkpoint file.
     last_checkpoint = checkpoint_dir / "last.ckpt"
     if last_checkpoint.exists():
