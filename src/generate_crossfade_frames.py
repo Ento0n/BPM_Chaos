@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
+
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "generated" / "diffusion"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "generated" / "crossfade"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+SQRT_2 = 2**0.5
 
 
 def natural_sort_key(path: Path) -> list[int | str]:
@@ -45,6 +53,18 @@ def load_image(path: Path, mode: str) -> Image.Image:
     return Image.open(path).convert(mode)
 
 
+def require_numpy() -> None:
+    if np is None:
+        raise RuntimeError("--method sdf requires numpy, but numpy is not installed.")
+
+
+@dataclass(frozen=True)
+class SdfImage:
+    signed_distance: np.ndarray
+    foreground_value: float
+    background_value: float
+
+
 def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     existing_frames = sorted(output_dir.glob("frame_*.png"), key=natural_sort_key)
@@ -59,6 +79,143 @@ def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
         frame_path.unlink()
 
 
+def ease_progress(t: float, easing: str) -> float:
+    if easing == "linear":
+        return t
+    if easing == "cosine":
+        return 0.5 - 0.5 * math.cos(math.pi * t)
+    raise ValueError(f"Unsupported easing: {easing}")
+
+
+def distance_to_mask(mask: np.ndarray) -> np.ndarray:
+    require_numpy()
+    height, width = mask.shape
+    max_distance = float(np.hypot(height, width))
+    if not mask.any():
+        return np.full(mask.shape, max_distance, dtype=np.float32)
+
+    distances = np.where(mask, 0.0, max_distance).astype(np.float32)
+
+    for y in range(height):
+        for x in range(width):
+            best = distances[y, x]
+            if x > 0:
+                best = min(best, distances[y, x - 1] + 1.0)
+            if y > 0:
+                best = min(best, distances[y - 1, x] + 1.0)
+            if x > 0 and y > 0:
+                best = min(best, distances[y - 1, x - 1] + SQRT_2)
+            if x + 1 < width and y > 0:
+                best = min(best, distances[y - 1, x + 1] + SQRT_2)
+            distances[y, x] = best
+
+    for y in range(height - 1, -1, -1):
+        for x in range(width - 1, -1, -1):
+            best = distances[y, x]
+            if x + 1 < width:
+                best = min(best, distances[y, x + 1] + 1.0)
+            if y + 1 < height:
+                best = min(best, distances[y + 1, x] + 1.0)
+            if x + 1 < width and y + 1 < height:
+                best = min(best, distances[y + 1, x + 1] + SQRT_2)
+            if x > 0 and y + 1 < height:
+                best = min(best, distances[y + 1, x - 1] + SQRT_2)
+            distances[y, x] = best
+
+    return distances
+
+
+def foreground_mask(gray_pixels: np.ndarray, threshold: int, foreground: str) -> np.ndarray:
+    white_mask = gray_pixels >= threshold
+    if foreground == "white":
+        return white_mask
+    if foreground == "black":
+        return ~white_mask
+    if foreground == "auto":
+        white_pixels = int(white_mask.sum())
+        black_pixels = int(white_mask.size - white_pixels)
+        return white_mask if white_pixels <= black_pixels else ~white_mask
+    raise ValueError(f"Unsupported foreground setting: {foreground}")
+
+
+def median_pixel_value(gray_pixels: np.ndarray, mask: np.ndarray, fallback: int) -> float:
+    if not mask.any():
+        return float(fallback)
+    return float(np.median(gray_pixels[mask]))
+
+
+def signed_distance_field(mask: np.ndarray) -> np.ndarray:
+    distance_to_foreground = distance_to_mask(mask)
+    distance_to_background = distance_to_mask(~mask)
+    return distance_to_foreground - distance_to_background
+
+
+def prepare_sdf_image(image: Image.Image, threshold: int, foreground: str) -> SdfImage:
+    require_numpy()
+    gray_pixels = np.asarray(image.convert("L"), dtype=np.uint8)
+    mask = foreground_mask(gray_pixels, threshold, foreground)
+    foreground_value = median_pixel_value(gray_pixels, mask, 255)
+    background_value = median_pixel_value(gray_pixels, ~mask, 0)
+    return SdfImage(
+        signed_distance=signed_distance_field(mask),
+        foreground_value=foreground_value,
+        background_value=background_value,
+    )
+
+
+def render_sdf_frame(
+    signed_distance: np.ndarray,
+    foreground_value: float,
+    background_value: float,
+    edge_softness: float,
+    mode: str,
+) -> Image.Image:
+    if edge_softness <= 0:
+        alpha = signed_distance <= 0
+        gray_pixels = np.where(alpha, foreground_value, background_value)
+    else:
+        alpha = np.clip(0.5 - signed_distance / edge_softness, 0.0, 1.0)
+        gray_pixels = background_value * (1.0 - alpha) + foreground_value * alpha
+
+    gray_pixels = np.clip(np.rint(gray_pixels), 0, 255).astype(np.uint8)
+    image = Image.fromarray(gray_pixels)
+    if mode == "L":
+        return image
+    if mode == "RGB":
+        return image.convert("RGB")
+    if mode == "RGBA":
+        return image.convert("RGBA")
+    raise ValueError(f"Unsupported image mode: {mode}")
+
+
+def blend_sdf_images(
+    start_image: SdfImage,
+    end_image: SdfImage,
+    t: float,
+    edge_softness: float,
+    mode: str,
+) -> Image.Image:
+    signed_distance = (
+        start_image.signed_distance * (1.0 - t)
+        + end_image.signed_distance * t
+    )
+    foreground_value = (
+        start_image.foreground_value * (1.0 - t)
+        + end_image.foreground_value * t
+    )
+    background_value = (
+        start_image.background_value * (1.0 - t)
+        + end_image.background_value * t
+    )
+    return render_sdf_frame(
+        signed_distance=signed_distance,
+        foreground_value=foreground_value,
+        background_value=background_value,
+        edge_softness=edge_softness,
+        mode=mode,
+    )
+
+
 def generate_crossfade_frames(
     image_paths: list[Path],
     output_dir: Path,
@@ -66,12 +223,22 @@ def generate_crossfade_frames(
     segment_frames: int,
     loop: bool,
     overwrite: bool,
+    method: str,
+    easing: str,
+    threshold: int,
+    foreground: str,
+    sdf_edge_softness: float,
 ) -> int:
     prepare_output_dir(output_dir, overwrite)
 
     first_image = load_image(image_paths[0], mode)
     image_size = first_image.size
     start_image = first_image
+    start_sdf_image = (
+        prepare_sdf_image(start_image, threshold, foreground)
+        if method == "sdf"
+        else None
+    )
     frame_index = 0
 
     target_paths = image_paths[1:]
@@ -85,14 +252,36 @@ def generate_crossfade_frames(
                 f"Image size mismatch: {target_path} is {end_image.size}, "
                 f"expected {image_size}."
             )
+        end_sdf_image = (
+            prepare_sdf_image(end_image, threshold, foreground)
+            if method == "sdf"
+            else None
+        )
 
         for step in range(segment_frames):
-            t = step / segment_frames
             output_path = output_dir / f"frame_{frame_index:06d}.png"
-            Image.blend(start_image, end_image, t).save(output_path)
+            if step == 0:
+                start_image.save(output_path)
+            else:
+                t = ease_progress(step / segment_frames, easing)
+                if method == "pixel":
+                    Image.blend(start_image, end_image, t).save(output_path)
+                elif method == "sdf":
+                    if start_sdf_image is None or end_sdf_image is None:
+                        raise RuntimeError("SDF images were not prepared.")
+                    blend_sdf_images(
+                        start_image=start_sdf_image,
+                        end_image=end_sdf_image,
+                        t=t,
+                        edge_softness=sdf_edge_softness,
+                        mode=mode,
+                    ).save(output_path)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
             frame_index += 1
 
         start_image = end_image
+        start_sdf_image = end_sdf_image
 
     if not loop:
         output_path = output_dir / f"frame_{frame_index:06d}.png"
@@ -111,6 +300,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pattern", type=str, default="*.png")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--bpm", type=float, default=120.0)
+    parser.add_argument(
+        "--method",
+        choices=("pixel", "sdf"),
+        default="pixel",
+        help="Interpolation method used between beat images.",
+    )
+    parser.add_argument(
+        "--easing",
+        choices=("linear", "cosine"),
+        default="linear",
+        help="Progress curve used inside each beat-to-beat transition.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=128,
+        help="Grayscale threshold used to build SDF masks.",
+    )
+    parser.add_argument(
+        "--foreground",
+        choices=("auto", "white", "black"),
+        default="auto",
+        help="Which side of the threshold should be treated as the shape.",
+    )
+    parser.add_argument(
+        "--sdf-edge-softness",
+        type=float,
+        default=1.5,
+        help="Width of the anti-aliased SDF edge in pixels. Use 0 for hard edges.",
+    )
     parser.add_argument(
         "--frames-per-beat",
         type=int,
@@ -153,11 +372,17 @@ def main() -> None:
         segment_frames=segment_frames,
         loop=args.loop,
         overwrite=args.overwrite,
+        method=args.method,
+        easing=args.easing,
+        threshold=args.threshold,
+        foreground=args.foreground,
+        sdf_edge_softness=args.sdf_edge_softness,
     )
 
     beat_count = len(image_paths)
     duration_seconds = frame_count / args.fps
     print(f"Loaded {beat_count} beat images from {args.input_dir}")
+    print(f"Interpolation method: {args.method}")
     print(f"Frames per beat: {segment_frames}")
     print(f"Saved {frame_count} frames to {args.output_dir}")
     print(f"Approx. duration at {args.fps:g} fps: {duration_seconds:.2f}s")

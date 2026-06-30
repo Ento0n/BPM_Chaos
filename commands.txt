@@ -1,0 +1,268 @@
+BPM Chaos command runbook
+========================
+
+Assumption
+----------
+Run commands from the project root:
+
+  cd /Users/antonspannagl/PythonProjects/BPM_Chaos
+
+Use the project conda environment:
+
+  conda run -n bpm_chaos python ...
+
+
+Pipeline order
+--------------
+
+1. Create / refresh the synthetic geometry dataset
+
+  conda run -n bpm_chaos python src/create_images.py
+
+Output:
+
+  data/synthetic_bw_256/*.png
+
+
+2. Train the diffusion model
+
+Convenience script with Mac-friendly defaults:
+
+  bash src/run/train_diffusion_model_20_percent.sh
+
+Direct command:
+
+  conda run -n bpm_chaos python src/train_diffusion_model.py \
+    --data-dir data/synthetic_bw_256 \
+    --output-dir checkpoints/diffusion \
+    --image-size 256 \
+    --batch-size 8 \
+    --num-workers 4 \
+    --max-epochs 10
+
+Useful training knobs:
+
+  --max-epochs 10
+  --batch-size 8
+  --learning-rate 1e-4
+  --accelerator mps
+  --accelerator cpu
+  --limit-train-batches 1000
+  --limit-val-batches 125
+  --disable-gradient-checkpointing
+
+Output:
+
+  checkpoints/diffusion/last.ckpt
+  checkpoints/diffusion/diffusion-epoch=XX-val_loss=YYYY.ckpt
+
+
+3. Generate beat images
+
+Use the latest checkpoint:
+
+  conda run -n bpm_chaos python src/generate_diffusion_images.py \
+    --checkpoint-dir checkpoints/diffusion \
+    --output-dir generated/diffusion \
+    --image-size 256 \
+    --num-images 120 \
+    --num-inference-steps 100 \
+    --seed 42
+
+Use a specific checkpoint:
+
+  conda run -n bpm_chaos python src/generate_diffusion_images.py \
+    --checkpoint checkpoints/diffusion/diffusion-epoch=08-val_loss=0.0118.ckpt \
+    --output-dir generated/diffusion \
+    --image-size 256 \
+    --num-images 120 \
+    --num-inference-steps 100 \
+    --seed 42
+
+Useful generation knobs:
+
+  --num-images 120           number of beat images
+  --image-size 256           must match training size
+  --num-inference-steps 100  more steps can improve quality, but is slower
+  --seed 42                  repeatable output
+  --accelerator mps
+  --accelerator cpu
+
+Output:
+
+  generated/diffusion/sample_000.png
+  generated/diffusion/sample_001.png
+  ...
+
+
+4. Generate transition frames between beat images
+
+Pixel crossfade baseline:
+
+  conda run -n bpm_chaos python src/generate_crossfade_frames.py \
+    --input-dir generated/diffusion \
+    --output-dir generated/crossfade_pixel \
+    --fps 30 \
+    --bpm 120 \
+    --method pixel \
+    --overwrite
+
+Signed-distance-field morph:
+
+  conda run -n bpm_chaos python src/generate_crossfade_frames.py \
+    --input-dir generated/diffusion \
+    --output-dir generated/crossfade_sdf \
+    --fps 30 \
+    --bpm 120 \
+    --method sdf \
+    --easing cosine \
+    --overwrite
+
+For 120 BPM at 30 FPS:
+
+  frames_per_beat = round(30 * 60 / 120) = 15
+
+With N beat images and no loop, the output frame count is:
+
+  (N - 1) * frames_per_beat + 1
+
+Useful transition knobs:
+
+  --fps 30
+  --bpm 120
+  --frames-per-beat 15       override fps/bpm calculation
+  --method pixel             simple image blend
+  --method sdf               shape morph via signed distance fields
+  --easing linear
+  --easing cosine            smoother start/end motion
+  --loop                     also morph last beat image back to first
+  --mode L                   grayscale output
+  --mode RGB
+  --overwrite
+
+SDF-specific knobs:
+
+  --threshold 128
+  --foreground auto          chooses the smaller black/white region as shape
+  --foreground white         white pixels are the shape
+  --foreground black         black pixels are the shape
+  --sdf-edge-softness 1.5    soft antialiasing edge in pixels
+  --sdf-edge-softness 0      hard thresholded SDF edges
+
+Output:
+
+  generated/crossfade_sdf/frame_000000.png
+  generated/crossfade_sdf/frame_000001.png
+  ...
+
+
+5. Create a video or preview GIF
+
+MP4 video, without audio:
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --frame-dir generated/crossfade_sdf \
+    --beat-dir generated/diffusion \
+    --output generated/videos/crossfade_sdf.mp4 \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
+
+MP4 video, with audio:
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --frame-dir generated/crossfade_sdf \
+    --beat-dir generated/diffusion \
+    --output generated/videos/crossfade_sdf_with_audio.mp4 \
+    --audio path/to/song.mp3 \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
+
+Quick GIF preview when ffmpeg is not installed:
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --frame-dir generated/crossfade_sdf \
+    --beat-dir generated/diffusion \
+    --output generated/videos/crossfade_sdf_preview.gif \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
+
+Useful video knobs:
+
+  --frame-dir generated/crossfade_sdf
+  --beat-dir generated/diffusion
+  --output generated/videos/name.mp4
+  --output generated/videos/name.gif
+  --audio path/to/song.mp3   MP4/video output only; requires ffmpeg
+  --fps 30
+  --bpm 120
+  --frames-per-beat 15
+  --loop
+  --skip-beat-validation     use frame-dir directly as ordered sequence
+  --overwrite
+
+Notes:
+
+  - MP4/MOV/MKV/WebM/AVI output requires ffmpeg in PATH.
+  - GIF output uses Pillow and has no audio.
+  - create_video_from_frames.py can detect whether the frame directory already
+    contains the full sequence including beat images.
+  - The current crossfade generator writes a full sequence including beat images.
+
+
+Common complete runs
+--------------------
+
+Generate 120 beat images, SDF transitions, and a GIF preview:
+
+  conda run -n bpm_chaos python src/generate_diffusion_images.py \
+    --checkpoint-dir checkpoints/diffusion \
+    --output-dir generated/diffusion \
+    --image-size 256 \
+    --num-images 120 \
+    --num-inference-steps 100 \
+    --seed 42
+
+  conda run -n bpm_chaos python src/generate_crossfade_frames.py \
+    --input-dir generated/diffusion \
+    --output-dir generated/crossfade_sdf \
+    --fps 30 \
+    --bpm 120 \
+    --method sdf \
+    --easing cosine \
+    --overwrite
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --frame-dir generated/crossfade_sdf \
+    --beat-dir generated/diffusion \
+    --output generated/videos/crossfade_sdf_preview.gif \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
+
+
+Generate pixel baseline transitions:
+
+  conda run -n bpm_chaos python src/generate_crossfade_frames.py \
+    --input-dir generated/diffusion \
+    --output-dir generated/crossfade_pixel \
+    --fps 30 \
+    --bpm 120 \
+    --method pixel \
+    --overwrite
+
+
+Generate SDF transitions with harder edges:
+
+  conda run -n bpm_chaos python src/generate_crossfade_frames.py \
+    --input-dir generated/diffusion \
+    --output-dir generated/crossfade_sdf_hard \
+    --fps 30 \
+    --bpm 120 \
+    --method sdf \
+    --easing cosine \
+    --sdf-edge-softness 0 \
+    --overwrite
+
