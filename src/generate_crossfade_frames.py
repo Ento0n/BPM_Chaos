@@ -8,6 +8,12 @@ from pathlib import Path
 
 from PIL import Image
 
+from generated_paths import (
+    DEFAULT_DIFFUSION_BEAT_SUBDIR,
+    DEFAULT_FRAME_SUBDIR,
+    validate_relative_subdir,
+)
+
 try:
     import numpy as np
 except ModuleNotFoundError:
@@ -295,8 +301,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate linear pixel-crossfade frames between beat images."
     )
-    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Timestamped generated run folder containing beat and frame subdirectories.",
+    )
+    parser.add_argument("--input-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--input-subdir",
+        type=str,
+        default=DEFAULT_DIFFUSION_BEAT_SUBDIR,
+        help="Subdirectory inside --run-dir containing beat images.",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        type=str,
+        default=DEFAULT_FRAME_SUBDIR,
+        help="Subdirectory inside --run-dir for generated frame_*.png files.",
+    )
     parser.add_argument("--pattern", type=str, default="*.png")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--bpm", type=float, default=120.0)
@@ -358,8 +382,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_run_paths(args: argparse.Namespace) -> None:
+    if args.run_dir is None:
+        args.input_dir = args.input_dir or DEFAULT_INPUT_DIR
+        args.output_dir = args.output_dir or DEFAULT_OUTPUT_DIR
+        return
+
+    input_subdir = validate_relative_subdir(args.input_subdir, "--input-subdir")
+    output_subdir = validate_relative_subdir(args.output_subdir, "--output-subdir")
+    args.input_dir = args.input_dir or args.run_dir / input_subdir
+    args.output_dir = args.output_dir or args.run_dir / output_subdir
+
+
 def main() -> None:
     args = parse_args()
+    resolve_run_paths(args)
     segment_frames = args.frames_per_beat or frames_per_beat(args.fps, args.bpm)
     if segment_frames <= 0:
         raise ValueError("--frames-per-beat must be greater than 0.")
@@ -381,6 +418,8 @@ def main() -> None:
 
     beat_count = len(image_paths)
     duration_seconds = frame_count / args.fps
+    if args.run_dir is not None:
+        print(f"Run folder: {args.run_dir}")
     print(f"Loaded {beat_count} beat images from {args.input_dir}")
     print(f"Interpolation method: {args.method}")
     print(f"Frames per beat: {segment_frames}")

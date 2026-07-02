@@ -10,6 +10,13 @@ from pathlib import Path
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
+from generated_paths import (
+    DEFAULT_DIFFUSION_BEAT_SUBDIR,
+    DEFAULT_FRAME_SUBDIR,
+    DEFAULT_GENERATED_DIR,
+    create_unique_run_dir,
+    validate_relative_subdir,
+)
 from generate_diffusion_images import find_checkpoint, get_device, save_image
 from train_diffusion_model import (
     DEFAULT_OUTPUT_DIR,
@@ -20,45 +27,31 @@ from train_diffusion_model import (
 from tqdm import tqdm
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FRAME_DIR = PROJECT_ROOT / "generated" / "diffusion_interpolation"
-DEFAULT_BEAT_DIR = PROJECT_ROOT / "generated" / "diffusion_interpolation_beats"
-
-
 class DeviceSelectionError(RuntimeError):
     pass
 
 
-def timestamp_run_id() -> str:
-    return datetime.now().strftime("%y_%m_%d-%H_%M_%S")
-
-
 def create_timestamped_run_dirs(
-    output_parent_dir: Path,
-    beat_output_parent_dir: Path | None,
-) -> tuple[str, Path, Path | None]:
-    output_parent_dir.mkdir(parents=True, exist_ok=True)
-    if beat_output_parent_dir is not None:
-        beat_output_parent_dir.mkdir(parents=True, exist_ok=True)
+    run_parent_dir: Path,
+    frame_subdir: str,
+    beat_subdir: str | None,
+) -> tuple[str, Path, Path, Path | None]:
+    frame_subdir_path = validate_relative_subdir(frame_subdir, "--frame-subdir")
+    beat_subdir_path = (
+        validate_relative_subdir(beat_subdir, "--beat-subdir")
+        if beat_subdir is not None
+        else None
+    )
 
-    while True:
-        run_id = timestamp_run_id()
-        output_dir = output_parent_dir / run_id
-        beat_output_dir = (
-            beat_output_parent_dir / run_id
-            if beat_output_parent_dir is not None
-            else None
-        )
+    run_id, run_dir = create_unique_run_dir(run_parent_dir)
+    output_dir = run_dir / frame_subdir_path
+    beat_output_dir = run_dir / beat_subdir_path if beat_subdir_path is not None else None
 
-        if output_dir.exists() or (beat_output_dir is not None and beat_output_dir.exists()):
-            time.sleep(1.0)
-            continue
+    output_dir.mkdir(parents=True, exist_ok=False)
+    if beat_output_dir is not None:
+        beat_output_dir.mkdir(parents=True, exist_ok=False)
 
-        output_dir.mkdir(parents=True, exist_ok=False)
-        if beat_output_dir is not None:
-            beat_output_dir.mkdir(parents=True, exist_ok=False)
-
-        return run_id, output_dir, beat_output_dir
+    return run_id, run_dir, output_dir, beat_output_dir
 
 
 def format_duration(seconds: float) -> str:
@@ -311,7 +304,6 @@ def make_frame_noise_batch(
 
 
 def save_metadata(
-    output_dir: Path,
     checkpoint_path: Path,
     args: argparse.Namespace,
     segment_frames: int,
@@ -320,16 +312,18 @@ def save_metadata(
 ) -> None:
     metadata = {
         "run_id": args.run_id,
+        "run_parent_dir": str(args.run_parent_dir),
+        "run_dir": str(args.run_dir),
+        "frame_subdir": args.frame_subdir,
+        "beat_subdir": None if args.no_save_beats else args.beat_subdir,
         "run_started_at": args.run_started_at,
         "run_finished_at": args.run_finished_at,
         "generation_elapsed_seconds": args.generation_elapsed_seconds,
         "generation_elapsed": args.generation_elapsed,
         "checkpoint": str(checkpoint_path),
-        "output_parent_dir": str(args.output_parent_dir),
+        "output_parent_dir": str(args.run_parent_dir),
         "output_dir": str(args.output_dir),
-        "beat_output_parent_dir": None
-        if args.no_save_beats
-        else str(args.beat_output_parent_dir),
+        "beat_output_parent_dir": None if args.no_save_beats else str(args.run_parent_dir),
         "beat_output_dir": None if args.no_save_beats else str(args.beat_output_dir),
         "num_beats": beat_count,
         "frame_count": frame_count,
@@ -349,7 +343,7 @@ def save_metadata(
         "easing": args.easing,
         "loop": args.loop,
     }
-    metadata_path = output_dir / "metadata.json"
+    metadata_path = args.run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
@@ -466,16 +460,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--run-parent-dir",
+        type=Path,
+        default=DEFAULT_GENERATED_DIR,
+        help="Parent directory for timestamped run folders.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=DEFAULT_FRAME_DIR,
-        help="Parent directory for timestamped frame run folders.",
+        default=None,
+        help="Deprecated alias for --run-parent-dir.",
+    )
+    parser.add_argument(
+        "--frame-subdir",
+        type=str,
+        default=DEFAULT_FRAME_SUBDIR,
+        help="Subdirectory inside the timestamped run folder for frame_*.png.",
+    )
+    parser.add_argument(
+        "--beat-subdir",
+        type=str,
+        default=DEFAULT_DIFFUSION_BEAT_SUBDIR,
+        help="Subdirectory inside the timestamped run folder for sample_*.png beat images.",
     )
     parser.add_argument(
         "--beat-output-dir",
         type=Path,
-        default=DEFAULT_BEAT_DIR,
-        help="Parent directory for timestamped beat image run folders.",
+        default=None,
+        help=(
+            "Deprecated alias for --beat-subdir. If supplied, only the final "
+            "path component is used."
+        ),
     )
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--num-beats", type=int, default=8)
@@ -565,16 +580,21 @@ def main() -> None:
     except DeviceSelectionError as error:
         raise SystemExit(f"Error: {error}") from error
 
-    output_parent_dir = args.output_dir
-    beat_output_parent_dir = None if args.no_save_beats else args.beat_output_dir
-    run_id, output_dir, beat_output_dir = create_timestamped_run_dirs(
-        output_parent_dir=output_parent_dir,
-        beat_output_parent_dir=beat_output_parent_dir,
+    run_parent_dir = args.output_dir or args.run_parent_dir
+    beat_subdir = None if args.no_save_beats else args.beat_subdir
+    if args.beat_output_dir is not None and beat_subdir is not None:
+        beat_subdir = args.beat_output_dir.name
+
+    run_id, run_dir, output_dir, beat_output_dir = create_timestamped_run_dirs(
+        run_parent_dir=run_parent_dir,
+        frame_subdir=args.frame_subdir,
+        beat_subdir=beat_subdir,
     )
 
     args.run_id = run_id
-    args.output_parent_dir = output_parent_dir
-    args.beat_output_parent_dir = beat_output_parent_dir
+    args.run_parent_dir = run_parent_dir
+    args.run_dir = run_dir
+    args.beat_subdir = beat_subdir
     args.output_dir = output_dir
     args.beat_output_dir = beat_output_dir
 
@@ -614,7 +634,6 @@ def main() -> None:
     args.generation_elapsed = elapsed_text
 
     save_metadata(
-        output_dir=args.output_dir,
         checkpoint_path=checkpoint_path,
         args=args,
         segment_frames=segment_frames,
@@ -624,6 +643,7 @@ def main() -> None:
 
     duration_seconds = frame_count / args.fps
     print(f"Run id: {run_id}")
+    print(f"Run folder: {run_dir}")
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Requested accelerator: {args.accelerator}")
     print(f"Resolved torch device: {resolved_device}")

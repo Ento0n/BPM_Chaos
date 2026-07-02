@@ -7,16 +7,17 @@ import torch
 from diffusers import DDPMScheduler
 from PIL import Image
 
+from generated_paths import (
+    DEFAULT_DIFFUSION_BEAT_SUBDIR,
+    DEFAULT_GENERATED_DIR,
+    create_unique_run_dir,
+    validate_relative_subdir,
+)
 from train_diffusion_model import (
     DEFAULT_OUTPUT_DIR,
     DiffusionModule,
     get_default_accelerator,
 )
-
-
-# Define simple defaults for generated images and checkpoint lookup.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GENERATED_DIR = PROJECT_ROOT / "generated" / "diffusion"
 
 
 def find_checkpoint(checkpoint_dir: Path) -> Path:
@@ -55,7 +56,30 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate grayscale DDPM images.")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_GENERATED_DIR)
+    parser.add_argument(
+        "--run-parent-dir",
+        type=Path,
+        default=DEFAULT_GENERATED_DIR,
+        help="Parent directory for timestamped run folders.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Existing run folder to write into.",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        type=str,
+        default=DEFAULT_DIFFUSION_BEAT_SUBDIR,
+        help="Subdirectory inside the run folder for sample_*.png.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Exact output directory. If omitted, writes to <run-dir>/<output-subdir>.",
+    )
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--num-images", type=int, default=8)
     parser.add_argument("--num-inference-steps", type=int, default=100)
@@ -64,11 +88,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_output_dir(args: argparse.Namespace) -> tuple[Path | None, Path]:
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        return None, args.output_dir
+
+    output_subdir = validate_relative_subdir(args.output_subdir, "--output-subdir")
+    if args.run_dir is None:
+        _, run_dir = create_unique_run_dir(args.run_parent_dir)
+    else:
+        run_dir = args.run_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir = run_dir / output_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, output_dir
+
+
 def main() -> None:
     # Resolve the checkpoint and output location.
     args = parse_args()
     checkpoint_path = args.checkpoint or find_checkpoint(args.checkpoint_dir)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir, output_dir = resolve_output_dir(args)
 
     # Load the trained Lightning checkpoint onto the selected device.
     device = get_device(args.accelerator)
@@ -108,11 +149,13 @@ def main() -> None:
 
     # Save every generated sample as a black-and-white PNG.
     for index, image_tensor in enumerate(images):
-        output_path = args.output_dir / f"sample_{index:03d}.png"
+        output_path = output_dir / f"sample_{index:03d}.png"
         save_image(image_tensor, output_path)
 
     print(f"Loaded checkpoint: {checkpoint_path}")
-    print(f"Saved {args.num_images} images to {args.output_dir}")
+    if run_dir is not None:
+        print(f"Run folder: {run_dir}")
+    print(f"Saved {args.num_images} images to {output_dir}")
 
 
 if __name__ == "__main__":

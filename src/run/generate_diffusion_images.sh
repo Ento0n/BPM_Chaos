@@ -9,7 +9,7 @@ cd "${PROJECT_ROOT}"
 # Generate 128x128 grayscale samples from the latest saved checkpoint.
 python src/generate_diffusion_images.py \
   --checkpoint /Users/antonspannagl/PythonProjects/BPM_Chaos/checkpoints/diffusion/diffusion-epoch=08-val_loss=0.0118.ckpt \
-  --output-dir /Users/antonspannagl/PythonProjects/BPM_Chaos/generated/v1 \
+  --run-parent-dir /Users/antonspannagl/PythonProjects/BPM_Chaos/generated \
   --image-size 256 \
   --num-images 8 \
   "$@"

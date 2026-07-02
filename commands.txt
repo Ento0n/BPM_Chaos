@@ -63,7 +63,7 @@ Use the latest checkpoint:
 
   conda run -n bpm_chaos python src/generate_diffusion_images.py \
     --checkpoint-dir checkpoints/diffusion \
-    --output-dir generated/diffusion \
+    --run-parent-dir generated \
     --image-size 256 \
     --num-images 120 \
     --num-inference-steps 100 \
@@ -73,7 +73,7 @@ Use a specific checkpoint:
 
   conda run -n bpm_chaos python src/generate_diffusion_images.py \
     --checkpoint checkpoints/diffusion/diffusion-epoch=08-val_loss=0.0118.ckpt \
-    --output-dir generated/diffusion \
+    --run-parent-dir generated \
     --image-size 256 \
     --num-images 120 \
     --num-inference-steps 100 \
@@ -81,6 +81,9 @@ Use a specific checkpoint:
 
 Useful generation knobs:
 
+  --run-parent-dir generated   create generated/YY_MM_DD-HH_MM_SS
+  --run-dir generated/name     write into an existing run folder
+  --output-subdir diffusion_beats
   --num-images 120           number of beat images
   --image-size 256           must match training size
   --num-inference-steps 100  more steps can improve quality, but is slower
@@ -90,8 +93,8 @@ Useful generation knobs:
 
 Output:
 
-  generated/diffusion/sample_000.png
-  generated/diffusion/sample_001.png
+  generated/YY_MM_DD-HH_MM_SS/diffusion_beats/sample_000.png
+  generated/YY_MM_DD-HH_MM_SS/diffusion_beats/sample_001.png
   ...
 
 
@@ -99,9 +102,11 @@ Output:
 
 Pixel crossfade baseline:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/generate_crossfade_frames.py \
-    --input-dir generated/diffusion \
-    --output-dir generated/crossfade_pixel \
+    --run-dir "$RUN_DIR" \
+    --output-subdir frames_pixel \
     --fps 30 \
     --bpm 120 \
     --method pixel \
@@ -109,9 +114,11 @@ Pixel crossfade baseline:
 
 Signed-distance-field morph:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/generate_crossfade_frames.py \
-    --input-dir generated/diffusion \
-    --output-dir generated/crossfade_sdf \
+    --run-dir "$RUN_DIR" \
+    --output-subdir frames_sdf \
     --fps 30 \
     --bpm 120 \
     --method sdf \
@@ -122,13 +129,13 @@ Diffusion noise interpolation:
 
   This generates beat anchors and in-between frames together from the saved
   diffusion checkpoint. It does not connect already-rendered beat PNGs.
-  The output-dir and beat-output-dir are parent folders. Each run creates a
-  timestamped child folder named like YY_MM_DD-HH_MM_SS.
+  Each run creates a timestamped child folder named like YY_MM_DD-HH_MM_SS
+  under generated, then writes frames, beat images, metadata, and later videos
+  into subfolders in that run.
 
   conda run -n bpm_chaos python src/generate_diffusion_interpolation_frames.py \
     --checkpoint-dir checkpoints/diffusion \
-    --output-dir generated/diffusion_interpolation \
-    --beat-output-dir generated/diffusion_interpolation_beats \
+    --run-parent-dir generated \
     --num-beats 120 \
     --image-size 256 \
     --fps 30 \
@@ -152,6 +159,9 @@ With N beat images and no loop, the output frame count is:
 
 Useful transition knobs:
 
+  --run-dir generated/YY_MM_DD-HH_MM_SS
+  --input-subdir diffusion_beats
+  --output-subdir frames
   --fps 30
   --bpm 120
   --frames-per-beat 15       override fps/bpm calculation
@@ -177,8 +187,9 @@ Diffusion-interpolation-specific knobs:
 
   --checkpoint-dir checkpoints/diffusion
   --checkpoint checkpoints/diffusion/name.ckpt
-  --output-dir generated/diffusion_interpolation
-  --beat-output-dir generated/diffusion_interpolation_beats
+  --run-parent-dir generated
+  --frame-subdir frames
+  --beat-subdir diffusion_beats
   --num-beats 120            number of diffusion beat anchors
   --scheduler ddim           deterministic and best for interpolation
   --scheduler ddpm           stochastic DDPM-style sampling
@@ -196,18 +207,18 @@ Diffusion-interpolation-specific knobs:
 
 Output:
 
-  generated/crossfade_sdf/frame_000000.png
-  generated/crossfade_sdf/frame_000001.png
+  generated/YY_MM_DD-HH_MM_SS/frames_sdf/frame_000000.png
+  generated/YY_MM_DD-HH_MM_SS/frames_sdf/frame_000001.png
   ...
 
 Diffusion interpolation output:
 
-  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/frame_000000.png
-  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/frame_000001.png
+  generated/YY_MM_DD-HH_MM_SS/frames/frame_000000.png
+  generated/YY_MM_DD-HH_MM_SS/frames/frame_000001.png
   ...
-  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/metadata.json
-  generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS/sample_000.png
-  generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS/sample_001.png
+  generated/YY_MM_DD-HH_MM_SS/metadata.json
+  generated/YY_MM_DD-HH_MM_SS/diffusion_beats/sample_000.png
+  generated/YY_MM_DD-HH_MM_SS/diffusion_beats/sample_001.png
 
   metadata.json includes run_started_at, run_finished_at, and total
   generation_elapsed_seconds / generation_elapsed.
@@ -217,20 +228,24 @@ Diffusion interpolation output:
 
 MP4 video, without audio:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --frame-dir generated/crossfade_sdf \
-    --beat-dir generated/diffusion \
-    --output generated/videos/crossfade_sdf.mp4 \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames_sdf \
+    --output "$RUN_DIR/videos/crossfade_sdf.mp4" \
     --fps 30 \
     --bpm 120 \
     --overwrite
 
 MP4 video, with audio:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --frame-dir generated/crossfade_sdf \
-    --beat-dir generated/diffusion \
-    --output generated/videos/crossfade_sdf_with_audio.mp4 \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames_sdf \
+    --output "$RUN_DIR/videos/crossfade_sdf_with_audio.mp4" \
     --audio path/to/song.mp3 \
     --fps 30 \
     --bpm 120 \
@@ -238,10 +253,12 @@ MP4 video, with audio:
 
 Quick GIF preview when ffmpeg is not installed:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --frame-dir generated/crossfade_sdf \
-    --beat-dir generated/diffusion \
-    --output generated/videos/crossfade_sdf_preview.gif \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames_sdf \
+    --output "$RUN_DIR/videos/crossfade_sdf_preview.gif" \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -251,19 +268,20 @@ Video from diffusion-interpolated frames:
   Replace YY_MM_DD-HH_MM_SS with the run id printed by the generator.
 
   conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --frame-dir generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS \
-    --beat-dir generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS \
-    --output generated/videos/diffusion_interpolation_preview.gif \
+    --run-dir generated/YY_MM_DD-HH_MM_SS \
+    --output generated/YY_MM_DD-HH_MM_SS/videos/diffusion_interpolation_preview.gif \
     --fps 30 \
     --bpm 120 \
     --overwrite
 
 Useful video knobs:
 
-  --frame-dir generated/crossfade_sdf
-  --beat-dir generated/diffusion
-  --output generated/videos/name.mp4
-  --output generated/videos/name.gif
+  --run-dir generated/YY_MM_DD-HH_MM_SS
+  --frame-subdir frames
+  --beat-subdir diffusion_beats
+  --video-subdir videos
+  --output generated/YY_MM_DD-HH_MM_SS/videos/name.mp4
+  --output generated/YY_MM_DD-HH_MM_SS/videos/name.gif
   --audio path/to/song.mp3   MP4/video output only; requires ffmpeg
   --fps 30
   --bpm 120
@@ -288,15 +306,17 @@ Generate 120 beat images, SDF transitions, and a GIF preview:
 
   conda run -n bpm_chaos python src/generate_diffusion_images.py \
     --checkpoint-dir checkpoints/diffusion \
-    --output-dir generated/diffusion \
+    --run-parent-dir generated \
     --image-size 256 \
     --num-images 120 \
     --num-inference-steps 100 \
     --seed 42
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/generate_crossfade_frames.py \
-    --input-dir generated/diffusion \
-    --output-dir generated/crossfade_sdf \
+    --run-dir "$RUN_DIR" \
+    --output-subdir frames_sdf \
     --fps 30 \
     --bpm 120 \
     --method sdf \
@@ -304,9 +324,9 @@ Generate 120 beat images, SDF transitions, and a GIF preview:
     --overwrite
 
   conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --frame-dir generated/crossfade_sdf \
-    --beat-dir generated/diffusion \
-    --output generated/videos/crossfade_sdf_preview.gif \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames_sdf \
+    --output "$RUN_DIR/videos/crossfade_sdf_preview.gif" \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -314,9 +334,11 @@ Generate 120 beat images, SDF transitions, and a GIF preview:
 
 Generate pixel baseline transitions:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/generate_crossfade_frames.py \
-    --input-dir generated/diffusion \
-    --output-dir generated/crossfade_pixel \
+    --run-dir "$RUN_DIR" \
+    --output-subdir frames_pixel \
     --fps 30 \
     --bpm 120 \
     --method pixel \
@@ -325,9 +347,11 @@ Generate pixel baseline transitions:
 
 Generate SDF transitions with harder edges:
 
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
   conda run -n bpm_chaos python src/generate_crossfade_frames.py \
-    --input-dir generated/diffusion \
-    --output-dir generated/crossfade_sdf_hard \
+    --run-dir "$RUN_DIR" \
+    --output-subdir frames_sdf_hard \
     --fps 30 \
     --bpm 120 \
     --method sdf \

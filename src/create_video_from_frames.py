@@ -9,6 +9,14 @@ from pathlib import Path
 
 from PIL import Image
 
+from generated_paths import (
+    DEFAULT_DIFFUSION_BEAT_SUBDIR,
+    DEFAULT_FRAME_SUBDIR,
+    DEFAULT_VIDEO_NAME,
+    DEFAULT_VIDEO_SUBDIR,
+    validate_relative_subdir,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BEAT_DIR = PROJECT_ROOT / "generated" / "diffusion"
@@ -225,9 +233,33 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Merge generated beat images and transition frames into a video."
     )
-    parser.add_argument("--frame-dir", type=Path, default=DEFAULT_FRAME_DIR)
-    parser.add_argument("--beat-dir", type=Path, default=DEFAULT_BEAT_DIR)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Timestamped generated run folder containing beat, frame, and video subdirectories.",
+    )
+    parser.add_argument("--frame-dir", type=Path, default=None)
+    parser.add_argument("--beat-dir", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--frame-subdir",
+        type=str,
+        default=DEFAULT_FRAME_SUBDIR,
+        help="Subdirectory inside --run-dir containing frame_*.png.",
+    )
+    parser.add_argument(
+        "--beat-subdir",
+        type=str,
+        default=DEFAULT_DIFFUSION_BEAT_SUBDIR,
+        help="Subdirectory inside --run-dir containing beat images.",
+    )
+    parser.add_argument(
+        "--video-subdir",
+        type=str,
+        default=DEFAULT_VIDEO_SUBDIR,
+        help="Subdirectory inside --run-dir for the default output file.",
+    )
     parser.add_argument("--frame-pattern", type=str, default="frame_*.png")
     parser.add_argument("--beat-pattern", type=str, default="*.png")
     parser.add_argument("--fps", type=float, default=30.0)
@@ -262,8 +294,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_run_paths(args: argparse.Namespace) -> None:
+    if args.run_dir is None:
+        args.frame_dir = args.frame_dir or DEFAULT_FRAME_DIR
+        args.beat_dir = args.beat_dir or DEFAULT_BEAT_DIR
+        args.output = args.output or DEFAULT_OUTPUT_PATH
+        return
+
+    frame_subdir = validate_relative_subdir(args.frame_subdir, "--frame-subdir")
+    beat_subdir = validate_relative_subdir(args.beat_subdir, "--beat-subdir")
+    video_subdir = validate_relative_subdir(args.video_subdir, "--video-subdir")
+    args.frame_dir = args.frame_dir or args.run_dir / frame_subdir
+    args.beat_dir = args.beat_dir or args.run_dir / beat_subdir
+    args.output = args.output or args.run_dir / video_subdir / DEFAULT_VIDEO_NAME
+
+
 def main() -> None:
     args = parse_args()
+    resolve_run_paths(args)
     segment_frames = args.frames_per_beat or frames_per_beat(args.fps, args.bpm)
     if segment_frames <= 0:
         raise ValueError("--frames-per-beat must be greater than 0.")
@@ -292,6 +340,8 @@ def main() -> None:
     )
 
     duration_seconds = len(sequence_paths) / args.fps
+    if args.run_dir is not None:
+        print(f"Run folder: {args.run_dir}")
     print(sequence_message)
     print(f"Frames per beat: {segment_frames}")
     print(f"Video frames: {len(sequence_paths)}")
