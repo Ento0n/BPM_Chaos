@@ -118,6 +118,30 @@ Signed-distance-field morph:
     --easing cosine \
     --overwrite
 
+Diffusion noise interpolation:
+
+  This generates beat anchors and in-between frames together from the saved
+  diffusion checkpoint. It does not connect already-rendered beat PNGs.
+  The output-dir and beat-output-dir are parent folders. Each run creates a
+  timestamped child folder named like YY_MM_DD-HH_MM_SS.
+
+  conda run -n bpm_chaos python src/generate_diffusion_interpolation_frames.py \
+    --checkpoint-dir checkpoints/diffusion \
+    --output-dir generated/diffusion_interpolation \
+    --beat-output-dir generated/diffusion_interpolation_beats \
+    --num-beats 120 \
+    --image-size 256 \
+    --fps 30 \
+    --bpm 120 \
+    --num-inference-steps 100 \
+    --scheduler ddim \
+    --interpolation slerp \
+    --easing cosine \
+    --accelerator mps \
+    --require-device mps \
+    --seed 42 \
+    --overwrite
+
 For 120 BPM at 30 FPS:
 
   frames_per_beat = round(30 * 60 / 120) = 15
@@ -149,11 +173,44 @@ SDF-specific knobs:
   --sdf-edge-softness 1.5    soft antialiasing edge in pixels
   --sdf-edge-softness 0      hard thresholded SDF edges
 
+Diffusion-interpolation-specific knobs:
+
+  --checkpoint-dir checkpoints/diffusion
+  --checkpoint checkpoints/diffusion/name.ckpt
+  --output-dir generated/diffusion_interpolation
+  --beat-output-dir generated/diffusion_interpolation_beats
+  --num-beats 120            number of diffusion beat anchors
+  --scheduler ddim           deterministic and best for interpolation
+  --scheduler ddpm           stochastic DDPM-style sampling
+  --interpolation slerp      spherical interpolation between noise anchors
+  --interpolation lerp       linear interpolation between noise anchors
+  --num-inference-steps 100
+  --batch-size 4             lower this if MPS/GPU memory is tight
+  --ddim-eta 0               keep 0 for deterministic DDIM
+  --accelerator mps          use Apple Metal GPU if available
+  --require-device mps       fail fast unless torch is really using MPS
+  --require-mps              shortcut for --require-device mps
+  --no-progress              disable the denoising progress bar
+  --no-save-beats            skip generated sample_*.png beat images
+  --overwrite                accepted, but timestamped run folders avoid overwrites
+
 Output:
 
   generated/crossfade_sdf/frame_000000.png
   generated/crossfade_sdf/frame_000001.png
   ...
+
+Diffusion interpolation output:
+
+  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/frame_000000.png
+  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/frame_000001.png
+  ...
+  generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS/metadata.json
+  generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS/sample_000.png
+  generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS/sample_001.png
+
+  metadata.json includes run_started_at, run_finished_at, and total
+  generation_elapsed_seconds / generation_elapsed.
 
 
 5. Create a video or preview GIF
@@ -185,6 +242,18 @@ Quick GIF preview when ffmpeg is not installed:
     --frame-dir generated/crossfade_sdf \
     --beat-dir generated/diffusion \
     --output generated/videos/crossfade_sdf_preview.gif \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
+
+Video from diffusion-interpolated frames:
+
+  Replace YY_MM_DD-HH_MM_SS with the run id printed by the generator.
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --frame-dir generated/diffusion_interpolation/YY_MM_DD-HH_MM_SS \
+    --beat-dir generated/diffusion_interpolation_beats/YY_MM_DD-HH_MM_SS \
+    --output generated/videos/diffusion_interpolation_preview.gif \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -265,4 +334,3 @@ Generate SDF transitions with harder edges:
     --easing cosine \
     --sdf-edge-softness 0 \
     --overwrite
-
