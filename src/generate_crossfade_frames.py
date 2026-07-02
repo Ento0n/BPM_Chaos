@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -289,7 +290,11 @@ def generate_crossfade_frames(
         start_image = end_image
         start_sdf_image = end_sdf_image
 
-    if not loop:
+    if loop:
+        output_path = output_dir / f"frame_{frame_index:06d}.png"
+        shutil.copy2(output_dir / "frame_000000.png", output_path)
+        frame_index += 1
+    else:
         output_path = output_dir / f"frame_{frame_index:06d}.png"
         start_image.save(output_path)
         frame_index += 1
@@ -372,7 +377,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Also crossfade from the last beat image back to the first.",
+        help=(
+            "Crossfade from the last beat image back to the first, then reuse "
+            "the first beat image as the final frame."
+        ),
     )
     parser.add_argument(
         "--overwrite",

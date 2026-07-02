@@ -157,6 +157,13 @@ With N beat images and no loop, the output frame count is:
 
   (N - 1) * frames_per_beat + 1
 
+With N beat images and --loop, the output frame count is:
+
+  N * frames_per_beat + 1
+
+  The final frame is a copy of the first beat image, so the rendered video can
+  close on the same picture it starts with.
+
 Useful transition knobs:
 
   --run-dir generated/YY_MM_DD-HH_MM_SS
@@ -169,7 +176,7 @@ Useful transition knobs:
   --method sdf               shape morph via signed distance fields
   --easing linear
   --easing cosine            smoother start/end motion
-  --loop                     also morph last beat image back to first
+  --loop                     morph last beat image back to first and close on first
   --mode L                   grayscale output
   --mode RGB
   --overwrite
@@ -203,6 +210,7 @@ Diffusion-interpolation-specific knobs:
   --require-mps              shortcut for --require-device mps
   --no-progress              disable the denoising progress bar
   --no-save-beats            skip generated sample_*.png beat images
+  --loop                     interpolate last beat anchor back to first and close on first
   --overwrite                accepted, but timestamped run folders avoid overwrites
 
 Output:
@@ -286,7 +294,7 @@ Useful video knobs:
   --fps 30
   --bpm 120
   --frames-per-beat 15
-  --loop
+  --loop                     use when the frame generator was run with --loop
   --skip-beat-validation     use frame-dir directly as ordered sequence
   --overwrite
 

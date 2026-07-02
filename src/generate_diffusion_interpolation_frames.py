@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -390,14 +391,15 @@ def generate_diffusion_interpolation_frames(
 
     anchor_noises = generate_anchor_noises(num_beats, image_size, seed)
     frame_specs = build_frame_specs(num_beats, segment_frames, loop)
-    frame_count = len(frame_specs)
+    generated_frame_count = len(frame_specs)
+    frame_count = generated_frame_count
     beat_count = 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if beat_output_dir is not None:
         beat_output_dir.mkdir(parents=True, exist_ok=True)
 
-    progress_total = frame_count * len(scheduler.timesteps)
+    progress_total = generated_frame_count * len(scheduler.timesteps)
     progress = create_progress(
         total=progress_total,
         description=f"Denoising on {device.type}",
@@ -405,7 +407,7 @@ def generate_diffusion_interpolation_frames(
     )
 
     try:
-        for batch_start in range(0, frame_count, batch_size):
+        for batch_start in range(0, generated_frame_count, batch_size):
             batch_specs = frame_specs[batch_start : batch_start + batch_size]
             batch_noise = make_frame_noise_batch(
                 anchor_noises=anchor_noises,
@@ -435,6 +437,11 @@ def generate_diffusion_interpolation_frames(
     finally:
         if progress is not None:
             progress.close()
+
+    if loop:
+        closing_frame_path = output_dir / f"frame_{frame_count:06d}.png"
+        shutil.copy2(output_dir / "frame_000000.png", closing_frame_path)
+        frame_count += 1
 
     return frame_count, beat_count, device, parameter_device
 
@@ -535,7 +542,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Also interpolate from the last beat anchor back to the first.",
+        help=(
+            "Interpolate from the last beat anchor back to the first, then reuse "
+            "the first beat image as the final frame."
+        ),
     )
     parser.add_argument(
         "--no-save-beats",

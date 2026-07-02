@@ -65,13 +65,20 @@ def build_frame_sequence(
         return frame_paths, "Using frame directory as a complete ordered sequence."
 
     segment_count = len(beat_paths) if loop else len(beat_paths) - 1
-    complete_count = segment_count * segment_frames + (0 if loop else 1)
+    complete_count = segment_count * segment_frames + 1
+    open_loop_count = segment_count * segment_frames if loop else None
     intermediate_count = segment_count * max(0, segment_frames - 1)
 
     if len(frame_paths) == complete_count:
         return (
             frame_paths,
-            "Frame directory already contains the complete sequence including beat images.",
+            "Frame directory already contains the complete closed sequence including beat images.",
+        )
+
+    if open_loop_count is not None and len(frame_paths) == open_loop_count:
+        return (
+            frame_paths + [frame_paths[0]],
+            "Frame directory contains an open loop sequence; reused the first frame as the closing frame.",
         )
 
     if len(frame_paths) == intermediate_count:
@@ -84,15 +91,20 @@ def build_frame_sequence(
             sequence.extend(frame_paths[frame_index : frame_index + transition_count])
             frame_index += transition_count
 
-        if not loop:
-            sequence.append(beat_paths[-1])
+        sequence.append(beat_paths[0] if loop else beat_paths[-1])
 
         return sequence, "Merged beat images with intermediate transition frames."
+
+    complete_count_message = str(complete_count)
+    if open_loop_count is not None:
+        complete_count_message = (
+            f"{complete_count} complete frames or {open_loop_count} open-loop frames"
+        )
 
     raise ValueError(
         "Frame count does not match the beat image count. "
         f"Found {len(beat_paths)} beat images and {len(frame_paths)} frame images. "
-        f"Expected either {complete_count} complete frames or "
+        f"Expected either {complete_count_message} or "
         f"{intermediate_count} intermediate frames for {segment_frames} frames per beat."
     )
 
@@ -279,7 +291,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Expect or assemble a loop from the last beat image back to the first.",
+        help=(
+            "Expect or assemble a closed loop from the last beat image back to "
+            "the first, reusing the first beat image as the final frame."
+        ),
     )
     parser.add_argument(
         "--skip-beat-validation",
