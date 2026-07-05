@@ -24,6 +24,10 @@ DEFAULT_FRAME_DIR = PROJECT_ROOT / "generated" / "crossfade"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "generated" / "videos" / "crossfade.mp4"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+DEFAULT_COLOR_0 = (0, 0, 0)
+DEFAULT_COLOR_1 = (255, 255, 255)
+RGBColor = tuple[int, int, int]
+ColorMap = tuple[RGBColor, RGBColor]
 
 
 def natural_sort_key(path: Path) -> list[int | str]:
@@ -42,6 +46,26 @@ def collect_image_paths(directory: Path, pattern: str) -> list[Path]:
         ),
         key=natural_sort_key,
     )
+
+
+def parse_hex_color(value: str) -> RGBColor:
+    color = value.strip()
+    if color.startswith("#"):
+        color = color[1:]
+
+    if len(color) == 3:
+        color = "".join(channel * 2 for channel in color)
+
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a valid hex color. Use RRGGBB or #RRGGBB."
+        )
+
+    return tuple(int(color[index : index + 2], 16) for index in range(0, 6, 2))
+
+
+def format_hex_color(color: RGBColor) -> str:
+    return f"#{color[0]:02X}{color[1]:02X}{color[2]:02X}"
 
 
 def frames_per_beat(fps: float, bpm: float) -> int:
@@ -131,10 +155,45 @@ def symlink_or_copy(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
-def create_ffmpeg_sequence(frame_paths: list[Path], sequence_dir: Path) -> str:
+def color_channel_lookup(zero_value: int, one_value: int) -> list[int]:
+    return [
+        int(round(zero_value + (one_value - zero_value) * pixel / 255.0))
+        for pixel in range(256)
+    ]
+
+
+def colorize_image(image: Image.Image, color_map: ColorMap) -> Image.Image:
+    color_0, color_1 = color_map
+    grayscale = image.convert("L")
+    channels = [
+        grayscale.point(color_channel_lookup(color_0[index], color_1[index]))
+        for index in range(3)
+    ]
+    return Image.merge("RGB", channels)
+
+
+def save_colorized_frame(source: Path, destination: Path, color_map: ColorMap) -> None:
+    with Image.open(source) as image:
+        colorized = colorize_image(image, color_map)
+
+    try:
+        colorized.save(destination)
+    finally:
+        colorized.close()
+
+
+def create_ffmpeg_sequence(
+    frame_paths: list[Path],
+    sequence_dir: Path,
+    color_map: ColorMap | None,
+) -> str:
     output_pattern = "frame_%06d.png"
     for index, frame_path in enumerate(frame_paths):
-        symlink_or_copy(frame_path, sequence_dir / f"frame_{index:06d}.png")
+        output_path = sequence_dir / f"frame_{index:06d}.png"
+        if color_map is None:
+            symlink_or_copy(frame_path, output_path)
+        else:
+            save_colorized_frame(frame_path, output_path, color_map)
     return output_pattern
 
 
@@ -144,6 +203,7 @@ def render_video_with_ffmpeg(
     fps: float,
     audio_path: Path | None,
     overwrite: bool,
+    color_map: ColorMap | None,
 ) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
@@ -158,7 +218,7 @@ def render_video_with_ffmpeg(
 
     with tempfile.TemporaryDirectory(prefix="bpm_video_frames_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        input_pattern = create_ffmpeg_sequence(frame_paths, temp_dir)
+        input_pattern = create_ffmpeg_sequence(frame_paths, temp_dir, color_map)
         command = [
             ffmpeg_path,
             "-y" if overwrite else "-n",
@@ -189,18 +249,32 @@ def render_video_with_ffmpeg(
         subprocess.run(command, check=True)
 
 
-def load_gif_frame(frame_path: Path) -> Image.Image:
+def load_gif_frame(frame_path: Path, color_map: ColorMap | None) -> Image.Image:
     with Image.open(frame_path) as image:
-        return image.convert("P", palette=Image.Palette.ADAPTIVE)
+        if color_map is None:
+            return image.convert("P", palette=Image.Palette.ADAPTIVE)
+
+        colorized = colorize_image(image, color_map)
+
+    try:
+        return colorized.convert("P", palette=Image.Palette.ADAPTIVE)
+    finally:
+        colorized.close()
 
 
-def render_gif(frame_paths: list[Path], output_path: Path, fps: float, overwrite: bool) -> None:
+def render_gif(
+    frame_paths: list[Path],
+    output_path: Path,
+    fps: float,
+    overwrite: bool,
+    color_map: ColorMap | None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"{output_path} already exists. Pass --overwrite to replace it.")
 
     duration_ms = max(1, int(round(1000.0 / fps)))
-    frames = [load_gif_frame(frame_path) for frame_path in frame_paths]
+    frames = [load_gif_frame(frame_path, color_map) for frame_path in frame_paths]
     first_frame = frames[0]
     remaining_frames = frames[1:]
 
@@ -223,16 +297,24 @@ def render_output(
     fps: float,
     audio_path: Path | None,
     overwrite: bool,
+    color_map: ColorMap | None,
 ) -> None:
     suffix = output_path.suffix.lower()
     if suffix == ".gif":
         if audio_path is not None:
             raise ValueError("GIF output cannot include audio. Use an MP4 output instead.")
-        render_gif(frame_paths, output_path, fps, overwrite)
+        render_gif(frame_paths, output_path, fps, overwrite, color_map)
         return
 
     if suffix in VIDEO_EXTENSIONS:
-        render_video_with_ffmpeg(frame_paths, output_path, fps, audio_path, overwrite)
+        render_video_with_ffmpeg(
+            frame_paths,
+            output_path,
+            fps,
+            audio_path,
+            overwrite,
+            color_map,
+        )
         return
 
     raise ValueError(
@@ -276,6 +358,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beat-pattern", type=str, default="*.png")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--bpm", type=float, default=120.0)
+    parser.add_argument(
+        "--color-0",
+        "--zero-color",
+        dest="color_0",
+        type=parse_hex_color,
+        default=None,
+        help=(
+            "Hex color for binary value 0. Accepts RRGGBB or #RRGGBB. "
+            "Defaults to #000000 when either color option is used."
+        ),
+    )
+    parser.add_argument(
+        "--color-1",
+        "--one-color",
+        dest="color_1",
+        type=parse_hex_color,
+        default=None,
+        help=(
+            "Hex color for binary value 1. Accepts RRGGBB or #RRGGBB. "
+            "Defaults to #FFFFFF when either color option is used."
+        ),
+    )
     parser.add_argument(
         "--frames-per-beat",
         type=int,
@@ -324,6 +428,16 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
     args.output = args.output or args.run_dir / video_subdir / DEFAULT_VIDEO_NAME
 
 
+def resolve_color_map(args: argparse.Namespace) -> ColorMap | None:
+    if args.color_0 is None and args.color_1 is None:
+        return None
+
+    return (
+        args.color_0 or DEFAULT_COLOR_0,
+        args.color_1 or DEFAULT_COLOR_1,
+    )
+
+
 def main() -> None:
     args = parse_args()
     resolve_run_paths(args)
@@ -346,12 +460,15 @@ def main() -> None:
     if audio_path is not None and not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+    color_map = resolve_color_map(args)
+
     render_output(
         frame_paths=sequence_paths,
         output_path=args.output,
         fps=args.fps,
         audio_path=audio_path,
         overwrite=args.overwrite,
+        color_map=color_map,
     )
 
     duration_seconds = len(sequence_paths) / args.fps
@@ -361,6 +478,9 @@ def main() -> None:
     print(f"Frames per beat: {segment_frames}")
     print(f"Video frames: {len(sequence_paths)}")
     print(f"Frame size: {image_size[0]}x{image_size[1]}")
+    if color_map is not None:
+        print(f"Color 0: {format_hex_color(color_map[0])}")
+        print(f"Color 1: {format_hex_color(color_map[1])}")
     print(f"Duration at {args.fps:g} fps: {duration_seconds:.2f}s")
     print(f"Saved output to {args.output}")
 

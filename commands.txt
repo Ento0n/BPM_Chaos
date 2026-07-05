@@ -293,6 +293,8 @@ Useful video knobs:
   --audio path/to/song.mp3   MP4/video output only; requires ffmpeg
   --fps 30
   --bpm 120
+  --color-0 111827           color for binary value 0, as RRGGBB or #RRGGBB
+  --color-1 F97316           color for binary value 1, as RRGGBB or #RRGGBB
   --frames-per-beat 15
   --loop                     use when the frame generator was run with --loop
   --skip-beat-validation     use frame-dir directly as ordered sequence
