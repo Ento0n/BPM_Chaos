@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from easing import EASING_CHOICES
 from generated_paths import (
     DEFAULT_DIFFUSION_BEAT_SUBDIR,
     DEFAULT_FRAME_SUBDIR,
@@ -22,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BEAT_DIR = PROJECT_ROOT / "generated" / "diffusion"
 DEFAULT_FRAME_DIR = PROJECT_ROOT / "generated" / "crossfade"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "generated" / "videos" / "crossfade.mp4"
+DEFAULT_GIF_OUTPUT_PATH = DEFAULT_OUTPUT_PATH.with_suffix(".gif")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 DEFAULT_COLOR_0 = (0, 0, 0)
@@ -46,6 +49,48 @@ def collect_image_paths(directory: Path, pattern: str) -> list[Path]:
         ),
         key=natural_sort_key,
     )
+
+
+def load_metadata(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Could not parse metadata file: {path}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"Metadata file must contain a JSON object: {path}")
+    return data
+
+
+def metadata_easing(*metadata_sources: dict[str, object]) -> str | None:
+    for metadata in metadata_sources:
+        easing = metadata.get("easing")
+        if isinstance(easing, str) and easing:
+            return easing
+    return None
+
+
+def safe_filename_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower())
+    return token.strip("-_.")
+
+
+def append_easing_to_name(path: Path, easing: str | None) -> Path:
+    if easing is None:
+        return path
+
+    token = safe_filename_token(easing)
+    if not token or token in path.stem.lower().split("_"):
+        return path
+
+    return path.with_name(f"{path.stem}_{token}{path.suffix}")
+
+
+def default_output_name(gif: bool) -> str:
+    if gif:
+        return Path(DEFAULT_VIDEO_NAME).with_suffix(".gif").name
+    return DEFAULT_VIDEO_NAME
 
 
 def parse_hex_color(value: str) -> RGBColor:
@@ -337,6 +382,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beat-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
+        "--gif",
+        action="store_true",
+        help="Create a GIF at the automatically determined output path.",
+    )
+    parser.add_argument(
         "--frame-subdir",
         type=str,
         default=DEFAULT_FRAME_SUBDIR,
@@ -358,6 +408,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beat-pattern", type=str, default="*.png")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--bpm", type=float, default=120.0)
+    parser.add_argument(
+        "--easing",
+        choices=EASING_CHOICES,
+        default=None,
+        help=(
+            "Easing label to include in the default output filename. "
+            "If omitted, metadata from the frame or run directory is used when available."
+        ),
+    )
     parser.add_argument(
         "--color-0",
         "--zero-color",
@@ -417,7 +476,11 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
     if args.run_dir is None:
         args.frame_dir = args.frame_dir or DEFAULT_FRAME_DIR
         args.beat_dir = args.beat_dir or DEFAULT_BEAT_DIR
-        args.output = args.output or DEFAULT_OUTPUT_PATH
+        frame_metadata = load_metadata(args.frame_dir / "metadata.json")
+        easing = args.easing or metadata_easing(frame_metadata)
+        args.resolved_easing = easing
+        default_output = DEFAULT_GIF_OUTPUT_PATH if args.gif else DEFAULT_OUTPUT_PATH
+        args.output = args.output or append_easing_to_name(default_output, easing)
         return
 
     frame_subdir = validate_relative_subdir(args.frame_subdir, "--frame-subdir")
@@ -425,7 +488,19 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
     video_subdir = validate_relative_subdir(args.video_subdir, "--video-subdir")
     args.frame_dir = args.frame_dir or args.run_dir / frame_subdir
     args.beat_dir = args.beat_dir or args.run_dir / beat_subdir
-    args.output = args.output or args.run_dir / video_subdir / DEFAULT_VIDEO_NAME
+    frame_metadata = load_metadata(args.frame_dir / "metadata.json")
+    run_metadata = load_metadata(args.run_dir / "metadata.json")
+    easing = args.easing or metadata_easing(frame_metadata, run_metadata)
+    args.resolved_easing = easing
+    default_output = args.run_dir / video_subdir / default_output_name(args.gif)
+    args.output = args.output or append_easing_to_name(default_output, easing)
+
+
+def validate_output_selection(args: argparse.Namespace) -> None:
+    if args.gif and args.output.suffix.lower() != ".gif":
+        raise ValueError("--gif requires a .gif output path or no --output.")
+    if args.gif and args.audio is not None:
+        raise ValueError("--gif cannot be used with --audio. GIF output has no audio.")
 
 
 def resolve_color_map(args: argparse.Namespace) -> ColorMap | None:
@@ -441,6 +516,7 @@ def resolve_color_map(args: argparse.Namespace) -> ColorMap | None:
 def main() -> None:
     args = parse_args()
     resolve_run_paths(args)
+    validate_output_selection(args)
     segment_frames = args.frames_per_beat or frames_per_beat(args.fps, args.bpm)
     if segment_frames <= 0:
         raise ValueError("--frames-per-beat must be greater than 0.")
@@ -481,6 +557,8 @@ def main() -> None:
     if color_map is not None:
         print(f"Color 0: {format_hex_color(color_map[0])}")
         print(f"Color 1: {format_hex_color(color_map[1])}")
+    if args.resolved_easing is not None:
+        print(f"Easing label: {args.resolved_easing}")
     print(f"Duration at {args.fps:g} fps: {duration_seconds:.2f}s")
     print(f"Saved output to {args.output}")
 

@@ -7,6 +7,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 export PYTHONUNBUFFERED=1
+EASING="${EASING:-logarithmic}"
 
 conda run -n bpm_chaos python src/generate_diffusion_interpolation_frames.py \
   --checkpoint-dir checkpoints/diffusion \
@@ -19,7 +20,7 @@ conda run -n bpm_chaos python src/generate_diffusion_interpolation_frames.py \
   --num-inference-steps 100 \
   --scheduler ddim \
   --interpolation slerp \
-  --easing cosine \
+  --easing "${EASING}" \
   --accelerator mps \
   --require-device mps \
   --seed 42 \

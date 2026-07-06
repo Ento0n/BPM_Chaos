@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import shutil
 import time
 from datetime import datetime
@@ -11,6 +10,7 @@ from pathlib import Path
 import torch
 from diffusers import DDIMScheduler, DDPMScheduler
 
+from easing import EASING_CHOICES, ease_progress
 from generated_paths import (
     DEFAULT_DIFFUSION_BEAT_SUBDIR,
     DEFAULT_FRAME_SUBDIR,
@@ -128,14 +128,6 @@ def validate_model_device(
             f"Model parameters are on {parameter_device}, but expected {expected_device}."
         )
     return parameter_device
-
-
-def ease_progress(t: float, easing: str) -> float:
-    if easing == "linear":
-        return t
-    if easing == "cosine":
-        return 0.5 - 0.5 * math.cos(math.pi * t)
-    raise ValueError(f"Unsupported easing: {easing}")
 
 
 def lerp(start: torch.Tensor, end: torch.Tensor, t: float) -> torch.Tensor:
@@ -534,7 +526,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--easing",
-        choices=("linear", "cosine"),
+        choices=EASING_CHOICES,
         default="cosine",
         help="Progress curve between beat anchors.",
     )

@@ -9,10 +9,12 @@ cd "${PROJECT_ROOT}"
 export PYTHONUNBUFFERED=1
 
 RUN_DIR="${RUN_DIR:-generated/26_07_03-11_18_06}"
+FRAME_SUBDIR="${FRAME_SUBDIR:-frames}"
 
 conda run -n bpm_chaos python src/create_video_from_frames.py \
   --run-dir "${RUN_DIR}" \
-  --output "${RUN_DIR}/videos/diffusion_interpolation_4_beats_60fps_colored.gif" \
+  --frame-subdir "${FRAME_SUBDIR}" \
+  --gif \
   --fps 60 \
   --bpm 120 \
   --color-0 "#abcdd6" \

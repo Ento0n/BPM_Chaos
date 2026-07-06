@@ -143,7 +143,7 @@ Diffusion noise interpolation:
     --num-inference-steps 100 \
     --scheduler ddim \
     --interpolation slerp \
-    --easing cosine \
+    --easing logarithmic \
     --accelerator mps \
     --require-device mps \
     --seed 42 \
@@ -176,6 +176,7 @@ Useful transition knobs:
   --method sdf               shape morph via signed distance fields
   --easing linear
   --easing cosine            smoother start/end motion
+  --easing logarithmic       fast change after each beat, then easing off
   --loop                     morph last beat image back to first and close on first
   --mode L                   grayscale output
   --mode RGB
@@ -232,7 +233,19 @@ Diffusion interpolation output:
   generation_elapsed_seconds / generation_elapsed.
 
 
-5. Create a video or preview GIF
+5. Create a GIF or video
+
+GIF preview:
+
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames_sdf \
+    --gif \
+    --fps 30 \
+    --bpm 120 \
+    --overwrite
 
 MP4 video, without audio:
 
@@ -241,7 +254,8 @@ MP4 video, without audio:
   conda run -n bpm_chaos python src/create_video_from_frames.py \
     --run-dir "$RUN_DIR" \
     --frame-subdir frames_sdf \
-    --output "$RUN_DIR/videos/crossfade_sdf.mp4" \
+    --output "$RUN_DIR/videos/crossfade_sdf_cosine.mp4" \
+    --easing cosine \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -253,20 +267,9 @@ MP4 video, with audio:
   conda run -n bpm_chaos python src/create_video_from_frames.py \
     --run-dir "$RUN_DIR" \
     --frame-subdir frames_sdf \
-    --output "$RUN_DIR/videos/crossfade_sdf_with_audio.mp4" \
+    --output "$RUN_DIR/videos/crossfade_sdf_cosine_with_audio.mp4" \
+    --easing cosine \
     --audio path/to/song.mp3 \
-    --fps 30 \
-    --bpm 120 \
-    --overwrite
-
-Quick GIF preview when ffmpeg is not installed:
-
-  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
-
-  conda run -n bpm_chaos python src/create_video_from_frames.py \
-    --run-dir "$RUN_DIR" \
-    --frame-subdir frames_sdf \
-    --output "$RUN_DIR/videos/crossfade_sdf_preview.gif" \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -277,7 +280,7 @@ Video from diffusion-interpolated frames:
 
   conda run -n bpm_chaos python src/create_video_from_frames.py \
     --run-dir generated/YY_MM_DD-HH_MM_SS \
-    --output generated/YY_MM_DD-HH_MM_SS/videos/diffusion_interpolation_preview.gif \
+    --gif \
     --fps 30 \
     --bpm 120 \
     --overwrite
@@ -288,6 +291,8 @@ Useful video knobs:
   --frame-subdir frames
   --beat-subdir diffusion_beats
   --video-subdir videos
+  --gif                      automatically writes videos/preview_<easing>.gif
+  --easing logarithmic       labels the default output filename
   --output generated/YY_MM_DD-HH_MM_SS/videos/name.mp4
   --output generated/YY_MM_DD-HH_MM_SS/videos/name.gif
   --audio path/to/song.mp3   MP4/video output only; requires ffmpeg
@@ -336,7 +341,7 @@ Generate 120 beat images, SDF transitions, and a GIF preview:
   conda run -n bpm_chaos python src/create_video_from_frames.py \
     --run-dir "$RUN_DIR" \
     --frame-subdir frames_sdf \
-    --output "$RUN_DIR/videos/crossfade_sdf_preview.gif" \
+    --gif \
     --fps 30 \
     --bpm 120 \
     --overwrite

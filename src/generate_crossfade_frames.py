@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 
+from easing import EASING_CHOICES, ease_progress
 from generated_paths import (
     DEFAULT_DIFFUSION_BEAT_SUBDIR,
     DEFAULT_FRAME_SUBDIR,
@@ -84,14 +86,6 @@ def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
         )
     for frame_path in existing_frames:
         frame_path.unlink()
-
-
-def ease_progress(t: float, easing: str) -> float:
-    if easing == "linear":
-        return t
-    if easing == "cosine":
-        return 0.5 - 0.5 * math.cos(math.pi * t)
-    raise ValueError(f"Unsupported easing: {easing}")
 
 
 def distance_to_mask(mask: np.ndarray) -> np.ndarray:
@@ -302,6 +296,30 @@ def generate_crossfade_frames(
     return frame_index
 
 
+def save_metadata(args: argparse.Namespace, segment_frames: int, frame_count: int) -> None:
+    metadata = {
+        "run_dir": None if args.run_dir is None else str(args.run_dir),
+        "input_dir": str(args.input_dir),
+        "output_dir": str(args.output_dir),
+        "input_subdir": args.input_subdir,
+        "output_subdir": args.output_subdir,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "frame_count": frame_count,
+        "fps": args.fps,
+        "bpm": args.bpm,
+        "frames_per_beat": segment_frames,
+        "method": args.method,
+        "easing": args.easing,
+        "loop": args.loop,
+        "mode": args.mode,
+        "threshold": args.threshold,
+        "foreground": args.foreground,
+        "sdf_edge_softness": args.sdf_edge_softness,
+    }
+    metadata_path = args.output_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate linear pixel-crossfade frames between beat images."
@@ -337,7 +355,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--easing",
-        choices=("linear", "cosine"),
+        choices=EASING_CHOICES,
         default="linear",
         help="Progress curve used inside each beat-to-beat transition.",
     )
@@ -423,6 +441,7 @@ def main() -> None:
         foreground=args.foreground,
         sdf_edge_softness=args.sdf_edge_softness,
     )
+    save_metadata(args, segment_frames, frame_count)
 
     beat_count = len(image_paths)
     duration_seconds = frame_count / args.fps
@@ -430,6 +449,7 @@ def main() -> None:
         print(f"Run folder: {args.run_dir}")
     print(f"Loaded {beat_count} beat images from {args.input_dir}")
     print(f"Interpolation method: {args.method}")
+    print(f"Easing: {args.easing}")
     print(f"Frames per beat: {segment_frames}")
     print(f"Saved {frame_count} frames to {args.output_dir}")
     print(f"Approx. duration at {args.fps:g} fps: {duration_seconds:.2f}s")
