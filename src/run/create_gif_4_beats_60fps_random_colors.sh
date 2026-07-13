@@ -10,7 +10,8 @@ export PYTHONUNBUFFERED=1
 
 RUN_DIR="${RUN_DIR:-generated/26_07_03-11_18_06}"
 FRAME_SUBDIR="${FRAME_SUBDIR:-frames}"
-COLOR_ARGS=(--random-colors-per-beat)
+COLOR_TRANSITION="${COLOR_TRANSITION:-step}"
+COLOR_ARGS=(--random-colors-per-beat --color-transition "${COLOR_TRANSITION}")
 
 # Without COLOR_SEED, the renderer generates a seed and includes it in the
 # output filename. Set COLOR_SEED=42 when an exactly reproducible rerender is
@@ -20,7 +21,8 @@ if [[ -n "${COLOR_SEED:-}" ]]; then
 fi
 
 # The renderer assigns one seeded 0/1 color pair to each 30-frame beat at
-# 60 FPS and 120 BPM. Extra arguments can override the output configuration.
+# 60 FPS and 120 BPM. Set COLOR_TRANSITION=gradient to ease between palettes.
+# Extra arguments can override the output configuration.
 conda run -n bpm_chaos python src/create_video_from_frames.py \
   --run-dir "${RUN_DIR}" \
   --frame-subdir "${FRAME_SUBDIR}" \

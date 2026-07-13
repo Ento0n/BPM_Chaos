@@ -22,11 +22,13 @@ from create_video_from_frames import (  # noqa: E402
     append_color_settings_to_name,
     build_random_frame_color_maps,
     colorize_image,
+    interpolate_color_map,
     resolve_color_seed,
     resolve_frame_color_maps,
     resolve_run_paths,
     validate_color_options,
 )
+from easing import ease_progress  # noqa: E402
 
 
 def color_args(
@@ -35,6 +37,7 @@ def color_args(
     color_1: tuple[int, int, int] | None = None,
     random_colors_per_beat: bool = False,
     color_seed: int | None = None,
+    color_transition: str = "step",
     loop: bool = False,
 ) -> Namespace:
     """Build the subset of parsed command-line arguments used by color logic."""
@@ -44,6 +47,8 @@ def color_args(
         random_colors_per_beat=random_colors_per_beat,
         color_seed=color_seed,
         resolved_color_seed=color_seed,
+        color_transition=color_transition,
+        resolved_easing="linear",
         loop=loop,
     )
 
@@ -131,6 +136,105 @@ class RandomBeatPaletteTests(unittest.TestCase):
 
         self.assertEqual(random.getstate(), state_before)
 
+    def test_gradient_uses_the_selected_easing_between_beat_palettes(self) -> None:
+        for easing in ("linear", "cosine", "logarithmic"):
+            with self.subTest(easing=easing):
+                frame_palettes, beat_palettes = build_random_frame_color_maps(
+                    frame_count=9,
+                    segment_frames=4,
+                    loop=False,
+                    seed=314159,
+                    transition="gradient",
+                    easing=easing,
+                )
+
+                # Beat frames stay exact. Between them, both binary endpoint
+                # colors follow the selected image-frame easing function.
+                self.assertEqual(frame_palettes[0], beat_palettes[0])
+                self.assertEqual(frame_palettes[4], beat_palettes[1])
+                self.assertEqual(frame_palettes[8], beat_palettes[2])
+                for step in range(1, 4):
+                    expected = interpolate_color_map(
+                        beat_palettes[0],
+                        beat_palettes[1],
+                        ease_progress(step / 4, easing),
+                    )
+                    self.assertEqual(frame_palettes[step], expected)
+
+    def test_one_frame_per_beat_keeps_gradient_anchors_exact(self) -> None:
+        frame_palettes, beat_palettes = build_random_frame_color_maps(
+            frame_count=4,
+            segment_frames=1,
+            loop=False,
+            seed=23,
+            transition="gradient",
+            easing="logarithmic",
+        )
+
+        self.assertEqual(frame_palettes, beat_palettes)
+
+    def test_loop_gradient_returns_smoothly_to_opening_palette(self) -> None:
+        frame_palettes, beat_palettes = build_random_frame_color_maps(
+            frame_count=9,
+            segment_frames=4,
+            loop=True,
+            seed=23,
+            transition="gradient",
+            easing="linear",
+        )
+
+        self.assertEqual(len(beat_palettes), 2)
+        self.assertEqual(frame_palettes[4], beat_palettes[1])
+        for step in range(1, 4):
+            expected = interpolate_color_map(
+                beat_palettes[1],
+                beat_palettes[0],
+                step / 4,
+            )
+            self.assertEqual(frame_palettes[4 + step], expected)
+        self.assertEqual(frame_palettes[-1], beat_palettes[0])
+
+    def test_partial_gradient_has_a_future_target_palette(self) -> None:
+        frame_palettes, beat_palettes = build_random_frame_color_maps(
+            frame_count=3,
+            segment_frames=4,
+            loop=False,
+            seed=23,
+            transition="gradient",
+            easing="linear",
+        )
+
+        self.assertEqual(len(beat_palettes), 2)
+        self.assertEqual(
+            frame_palettes[2],
+            interpolate_color_map(beat_palettes[0], beat_palettes[1], 0.5),
+        )
+
+    def test_partial_gradient_loop_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Gradient loop sequences must contain a whole number of beats",
+        ):
+            build_random_frame_color_maps(
+                frame_count=8,
+                segment_frames=4,
+                loop=True,
+                seed=23,
+                transition="gradient",
+                easing="linear",
+            )
+
+    def test_gradient_rejects_an_unknown_easing(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported easing 'unknown'"):
+            build_random_frame_color_maps(
+                frame_count=1,
+                segment_frames=1,
+                loop=False,
+                seed=23,
+                transition="gradient",
+                easing="unknown",
+            )
+
 
 class BinaryColorMappingTests(unittest.TestCase):
     def test_binary_values_map_exactly_to_selected_endpoint_colors(self) -> None:
@@ -196,6 +300,15 @@ class ColorOptionTests(unittest.TestCase):
         ):
             validate_color_options(args)
 
+    def test_gradient_transition_requires_random_beat_colors(self) -> None:
+        args = color_args(color_transition="gradient")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--color-transition gradient requires --random-colors-per-beat",
+        ):
+            validate_color_options(args)
+
 
 class ColorOutputFilenameTests(unittest.TestCase):
     def test_color_settings_are_included_in_automatic_names(self) -> None:
@@ -216,6 +329,14 @@ class ColorOutputFilenameTests(unittest.TestCase):
                 ),
                 "preview_random-colors-per-beat-seed-42.mp4",
             ),
+            (
+                color_args(
+                    random_colors_per_beat=True,
+                    color_seed=42,
+                    color_transition="gradient",
+                ),
+                "preview_random-colors-per-beat-gradient-seed-42.mp4",
+            ),
         ]
 
         for args, expected_name in cases:
@@ -224,7 +345,10 @@ class ColorOutputFilenameTests(unittest.TestCase):
                 self.assertEqual(output.name, expected_name)
 
     def test_generated_seed_is_reused_by_filename_and_palette(self) -> None:
-        args = color_args(random_colors_per_beat=True)
+        args = color_args(
+            random_colors_per_beat=True,
+            color_transition="gradient",
+        )
         with patch(
             "create_video_from_frames.random.SystemRandom"
         ) as system_random:
@@ -242,7 +366,7 @@ class ColorOutputFilenameTests(unittest.TestCase):
         self.assertEqual(palette_seed, 987654321)
         self.assertEqual(
             output.name,
-            "preview_random-colors-per-beat-seed-987654321.gif",
+            "preview_random-colors-per-beat-gradient-seed-987654321.gif",
         )
 
     def test_default_name_combines_easing_and_color_settings(self) -> None:
@@ -270,8 +394,63 @@ class ColorOutputFilenameTests(unittest.TestCase):
             ),
         )
 
+    def test_default_gradient_name_uses_the_resolved_easing(self) -> None:
+        args = color_args(
+            random_colors_per_beat=True,
+            color_seed=42,
+            color_transition="gradient",
+        )
+        args.run_dir = Path("generated/example")
+        args.frame_subdir = "frames"
+        args.beat_subdir = "diffusion_beats"
+        args.video_subdir = "videos"
+        args.frame_dir = None
+        args.beat_dir = None
+        args.output = None
+        args.gif = True
+        args.easing = "cosine"
+
+        resolve_run_paths(args)
+
+        self.assertEqual(args.resolved_easing, "cosine")
+        self.assertEqual(
+            args.output,
+            Path(
+                "generated/example/videos/"
+                "preview_cosine_random-colors-per-beat-gradient-seed-42.gif"
+            ),
+        )
+
+    def test_unlabeled_gradient_defaults_to_linear_easing(self) -> None:
+        args = color_args(
+            random_colors_per_beat=True,
+            color_seed=42,
+            color_transition="gradient",
+        )
+        args.run_dir = Path("generated/no-metadata")
+        args.frame_subdir = "frames"
+        args.beat_subdir = "diffusion_beats"
+        args.video_subdir = "videos"
+        args.frame_dir = None
+        args.beat_dir = None
+        args.output = None
+        args.gif = False
+        args.easing = None
+
+        resolve_run_paths(args)
+
+        self.assertEqual(args.resolved_easing, "linear")
+        self.assertEqual(
+            args.output.name,
+            "preview_linear_random-colors-per-beat-gradient-seed-42.mp4",
+        )
+
     def test_explicit_output_name_is_preserved(self) -> None:
-        args = color_args(random_colors_per_beat=True, color_seed=42)
+        args = color_args(
+            random_colors_per_beat=True,
+            color_seed=42,
+            color_transition="gradient",
+        )
         args.run_dir = Path("generated/example")
         args.frame_subdir = "frames"
         args.beat_subdir = "diffusion_beats"

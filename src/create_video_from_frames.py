@@ -1,7 +1,7 @@
 """Assemble generated frames into GIF/video output with optional recoloring.
 
 Binary/grayscale source frames can keep their original colors, use one fixed
-0/1 color pair, or use a seeded random pair that changes exactly on each beat.
+0/1 color pair, or use seeded random pairs that switch or ease between beats.
 Both GIF and ffmpeg output consume the same per-frame color plan.
 """
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from easing import EASING_CHOICES
+from easing import EASING_CHOICES, ease_progress
 from generated_paths import (
     DEFAULT_DIFFUSION_BEAT_SUBDIR,
     DEFAULT_FRAME_SUBDIR,
@@ -36,6 +36,7 @@ DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "generated" / "videos" / "crossfade.mp4"
 DEFAULT_GIF_OUTPUT_PATH = DEFAULT_OUTPUT_PATH.with_suffix(".gif")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+COLOR_TRANSITION_CHOICES = ("step", "gradient")
 DEFAULT_COLOR_0 = (0, 0, 0)
 DEFAULT_COLOR_1 = (255, 255, 255)
 RGBColor = tuple[int, int, int]
@@ -81,6 +82,22 @@ def metadata_easing(*metadata_sources: dict[str, object]) -> str | None:
     return None
 
 
+def resolve_easing(
+    args: argparse.Namespace,
+    *metadata_sources: dict[str, object],
+) -> str | None:
+    """Resolve the shared frame/color easing, using linear for unlabeled gradients."""
+    easing = args.easing or metadata_easing(*metadata_sources)
+    if easing is None and args.color_transition == "gradient":
+        return "linear"
+    if args.color_transition == "gradient" and easing not in EASING_CHOICES:
+        raise ValueError(
+            f"Unsupported easing {easing!r} for gradient colors. "
+            f"Choose one of: {', '.join(EASING_CHOICES)}."
+        )
+    return easing
+
+
 def safe_filename_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower())
     return token.strip("-_.")
@@ -111,9 +128,13 @@ def append_color_settings_to_name(path: Path, args: argparse.Namespace) -> Path:
     unchanged.
     """
     if args.random_colors_per_beat:
+        transition_token = (
+            "-gradient" if args.color_transition == "gradient" else ""
+        )
         return append_token_to_name(
             path,
-            f"random-colors-per-beat-seed-{args.resolved_color_seed}",
+            "random-colors-per-beat"
+            f"{transition_token}-seed-{args.resolved_color_seed}",
         )
 
     if args.color_0 is None and args.color_1 is None:
@@ -283,26 +304,82 @@ def random_rgb_color(generator: random.Random) -> RGBColor:
     )
 
 
+def interpolate_rgb_color(
+    start: RGBColor,
+    end: RGBColor,
+    progress: float,
+) -> RGBColor:
+    """Interpolate one RGB color; progress is expected in the range 0..1."""
+    return tuple(
+        int(round(start[channel] * (1.0 - progress) + end[channel] * progress))
+        for channel in range(3)
+    )
+
+
+def interpolate_color_map(
+    start: ColorMap,
+    end: ColorMap,
+    progress: float,
+) -> ColorMap:
+    """Interpolate the binary 0 and 1 colors independently."""
+    return (
+        interpolate_rgb_color(start[0], end[0], progress),
+        interpolate_rgb_color(start[1], end[1], progress),
+    )
+
+
 def build_random_frame_color_maps(
     frame_count: int,
     segment_frames: int,
     loop: bool,
     seed: int,
+    transition: str = "step",
+    easing: str = "linear",
 ) -> tuple[FrameColorMaps, list[ColorMap]]:
     """Create one random binary palette per beat and assign it to each frame.
 
     Beat anchors occur at frame indices 0, segment_frames, 2 * segment_frames,
-    and so on. A palette changes exactly at those indices and remains fixed for
-    the following transition frames. For a loop, the final duplicated anchor
-    uses beat 0's palette so both the image and its colors close seamlessly.
+    and so on. ``step`` holds each palette until the next beat. ``gradient``
+    interpolates both the 0 and 1 colors toward the next beat using the same
+    easing as the generated imagery. For a loop, the final segment gradients
+    toward beat 0 and the duplicated closing frame uses beat 0 exactly.
     """
     if frame_count < 1:
         raise ValueError("At least one frame is required to create color maps.")
     if segment_frames < 1:
         raise ValueError("Frames per beat must be greater than 0.")
+    if transition not in COLOR_TRANSITION_CHOICES:
+        raise ValueError(f"Unsupported color transition: {transition}")
+    if transition == "gradient" and easing not in EASING_CHOICES:
+        raise ValueError(
+            f"Unsupported easing {easing!r} for gradient colors. "
+            f"Choose one of: {', '.join(EASING_CHOICES)}."
+        )
+    if transition == "gradient" and loop and (frame_count - 1) % segment_frames:
+        raise ValueError(
+            "Gradient loop sequences must contain a whole number of beats: "
+            "(frame_count - 1) must be divisible by frames per beat."
+        )
 
     generator = random.Random(seed)
-    beat_color_maps: list[ColorMap] = []
+    last_active_frame = (
+        frame_count - 2 if loop and frame_count > 1 else frame_count - 1
+    )
+    beat_count = last_active_frame // segment_frames + 1
+
+    # A partial non-loop gradient still needs the next beat palette as its
+    # interpolation target, even though that target anchor is not rendered.
+    if (
+        transition == "gradient"
+        and not loop
+        and last_active_frame % segment_frames != 0
+    ):
+        beat_count += 1
+
+    beat_color_maps = [
+        (random_rgb_color(generator), random_rgb_color(generator))
+        for _ in range(beat_count)
+    ]
     frame_color_maps: FrameColorMaps = []
 
     for frame_index in range(frame_count):
@@ -313,11 +390,22 @@ def build_random_frame_color_maps(
             continue
 
         beat_index = frame_index // segment_frames
-        while len(beat_color_maps) <= beat_index:
-            beat_color_maps.append(
-                (random_rgb_color(generator), random_rgb_color(generator))
+        step = frame_index % segment_frames
+        if transition == "step" or step == 0:
+            frame_color_maps.append(beat_color_maps[beat_index])
+            continue
+
+        next_beat_index = (
+            (beat_index + 1) % beat_count if loop else beat_index + 1
+        )
+        progress = ease_progress(step / segment_frames, easing)
+        frame_color_maps.append(
+            interpolate_color_map(
+                beat_color_maps[beat_index],
+                beat_color_maps[next_beat_index],
+                progress,
             )
-        frame_color_maps.append(beat_color_maps[beat_index])
+        )
 
     return frame_color_maps, beat_color_maps
 
@@ -521,8 +609,9 @@ def parse_args() -> argparse.Namespace:
         choices=EASING_CHOICES,
         default=None,
         help=(
-            "Easing label to include in the default output filename. "
-            "If omitted, metadata from the frame or run directory is used when available."
+            "Easing for gradient color transitions and the default output "
+            "filename label. If omitted, frame/run metadata is used; an "
+            "unlabeled color gradient defaults to linear."
         ),
     )
     parser.add_argument(
@@ -553,8 +642,9 @@ def parse_args() -> argparse.Namespace:
         dest="random_colors_per_beat",
         action="store_true",
         help=(
-            "Choose new random colors for binary values 0 and 1 at every beat. "
-            "The pair changes on the beat and is held until the next beat."
+            "Choose a new random color-pair anchor for binary values 0 and 1 "
+            "at every beat. --color-transition controls whether palettes "
+            "switch or interpolate between anchors."
         ),
     )
     parser.add_argument(
@@ -565,6 +655,17 @@ def parse_args() -> argparse.Namespace:
             "Seed for --random-colors-per-beat. If omitted, a random seed is "
             "chosen, included in the automatic output filename, and printed "
             "so the palette can be reproduced."
+        ),
+    )
+    parser.add_argument(
+        "--color-transition",
+        "--random-color-transition",
+        choices=COLOR_TRANSITION_CHOICES,
+        default="step",
+        help=(
+            "How random beat colors change: 'step' switches on each beat; "
+            "'gradient' interpolates to the next beat using the resolved "
+            "--easing label."
         ),
     )
     parser.add_argument(
@@ -605,7 +706,7 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
         args.frame_dir = args.frame_dir or DEFAULT_FRAME_DIR
         args.beat_dir = args.beat_dir or DEFAULT_BEAT_DIR
         frame_metadata = load_metadata(args.frame_dir / "metadata.json")
-        easing = args.easing or metadata_easing(frame_metadata)
+        easing = resolve_easing(args, frame_metadata)
         args.resolved_easing = easing
         default_output = DEFAULT_GIF_OUTPUT_PATH if args.gif else DEFAULT_OUTPUT_PATH
         if args.output is None:
@@ -622,7 +723,7 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
     args.beat_dir = args.beat_dir or args.run_dir / beat_subdir
     frame_metadata = load_metadata(args.frame_dir / "metadata.json")
     run_metadata = load_metadata(args.run_dir / "metadata.json")
-    easing = args.easing or metadata_easing(frame_metadata, run_metadata)
+    easing = resolve_easing(args, frame_metadata, run_metadata)
     args.resolved_easing = easing
     default_output = args.run_dir / video_subdir / default_output_name(args.gif)
     if args.output is None:
@@ -649,6 +750,10 @@ def validate_color_options(args: argparse.Namespace) -> None:
         )
     if args.color_seed is not None and not args.random_colors_per_beat:
         raise ValueError("--color-seed requires --random-colors-per-beat.")
+    if args.color_transition == "gradient" and not args.random_colors_per_beat:
+        raise ValueError(
+            "--color-transition gradient requires --random-colors-per-beat."
+        )
 
 
 def resolve_color_seed(args: argparse.Namespace) -> None:
@@ -687,6 +792,8 @@ def resolve_frame_color_maps(
             segment_frames=segment_frames,
             loop=args.loop,
             seed=color_seed,
+            transition=args.color_transition,
+            easing=args.resolved_easing or "linear",
         )
         return frame_color_maps, beat_color_maps, color_seed
 
@@ -757,6 +864,7 @@ def main() -> None:
     print(f"Frame size: {image_size[0]}x{image_size[1]}")
     if args.random_colors_per_beat:
         print(f"Random color pairs: {len(beat_color_maps)} (one per beat)")
+        print(f"Color transition: {args.color_transition}")
         print(f"Color seed: {color_seed}")
     elif beat_color_maps:
         print(f"Color 0: {format_hex_color(beat_color_maps[0][0])}")

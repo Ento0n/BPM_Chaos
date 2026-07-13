@@ -315,7 +315,7 @@ Video from diffusion-interpolated frames:
     --bpm 120 \
     --overwrite
 
-Beat-synchronized random colors (a new color pair for binary 0 and 1 on each beat):
+Beat-synchronized random colors with an eased gradient between palettes:
 
   RUN_DIR=generated/YY_MM_DD-HH_MM_SS
 
@@ -325,15 +325,23 @@ Beat-synchronized random colors (a new color pair for binary 0 and 1 on each bea
     --fps 30 \
     --bpm 120 \
     --random-colors-per-beat \
+    --color-transition gradient \
+    --easing cosine \
     --overwrite
 
   The automatic filename includes the generated seed, for example:
 
-  videos/preview_cosine_random-colors-per-beat-seed-123456789.mp4
+  videos/preview_cosine_random-colors-per-beat-gradient-seed-123456789.mp4
+
+  Both binary endpoint colors are interpolated throughout each beat interval.
+  The color gradient uses --easing, then frame/run metadata, and finally linear
+  easing when no label is available. Use --color-transition step for the
+  original hard color switch on every beat.
 
 For the existing four-beat, 60 FPS example run:
 
   RUN_DIR=generated/YY_MM_DD-HH_MM_SS \
+    COLOR_TRANSITION=gradient \
     bash src/run/create_gif_4_beats_60fps_random_colors.sh
 
 Useful video knobs:
@@ -354,6 +362,8 @@ Useful video knobs:
   --random-colors-per-beat   choose new random colors for 0 and 1 at each beat
   --random-colors            alias for --random-colors-per-beat
   --color-seed 42            reproduce colors; generated and named if omitted
+  --color-transition step    switch to each new palette exactly on the beat
+  --color-transition gradient ease between beat palettes using --easing
   --frames-per-beat 15
   --loop                     use when the frame generator was run with --loop
   --skip-beat-validation     use frame-dir directly as ordered sequence
