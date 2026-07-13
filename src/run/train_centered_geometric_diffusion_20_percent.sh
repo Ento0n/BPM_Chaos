@@ -9,8 +9,10 @@ cd "${PROJECT_ROOT}"
 # Keep training prints and Lightning logs visible while the process is running.
 export PYTHONUNBUFFERED=1
 
-# Conservative Mac defaults; pass extra CLI args after this script to override them.
+# Conservative Mac defaults for the centered geometric training set.
 python -u src/train_diffusion_model.py \
+  --data-dir data/centered_geometric_bw_256 \
+  --output-dir checkpoints/diffusion_centered_geometric \
   --batch-size 8 \
   --num-workers 4 \
   --log-resource-every-n-steps 500 \

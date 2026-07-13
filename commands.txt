@@ -24,17 +24,47 @@ Output:
   data/synthetic_bw_256/*.png
 
 
+1a. Create / refresh the centered geometric training dataset
+
+  conda run -n bpm_chaos python src/create_centered_geometric_images.py
+
+Output:
+
+  data/centered_geometric_bw_256/*.png
+
+Centered dataset knobs:
+
+  --count 50000
+  --image-size 256
+  --output-dir data/centered_geometric_bw_256
+  --clear
+
+
 2. Train the diffusion model
 
 Convenience script with Mac-friendly defaults:
 
   bash src/run/train_diffusion_model_20_percent.sh
 
+Centered geometric convenience script:
+
+  bash src/run/train_centered_geometric_diffusion_20_percent.sh
+
 Direct command:
 
-  conda run -n bpm_chaos python src/train_diffusion_model.py \
+  conda run --no-capture-output -n bpm_chaos python -u src/train_diffusion_model.py \
     --data-dir data/synthetic_bw_256 \
     --output-dir checkpoints/diffusion \
+    --image-size 256 \
+    --batch-size 8 \
+    --num-workers 4 \
+    --max-epochs 10
+
+Centered geometric direct command:
+
+  conda run --no-capture-output -n bpm_chaos python -u src/train_diffusion_model.py \
+    --data-dir data/centered_geometric_bw_256 \
+    --output-dir checkpoints/diffusion_centered_geometric \
     --image-size 256 \
     --batch-size 8 \
     --num-workers 4 \
@@ -285,13 +315,34 @@ Video from diffusion-interpolated frames:
     --bpm 120 \
     --overwrite
 
+Beat-synchronized random colors (a new color pair for binary 0 and 1 on each beat):
+
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS
+
+  conda run -n bpm_chaos python src/create_video_from_frames.py \
+    --run-dir "$RUN_DIR" \
+    --frame-subdir frames \
+    --fps 30 \
+    --bpm 120 \
+    --random-colors-per-beat \
+    --overwrite
+
+  The automatic filename includes the generated seed, for example:
+
+  videos/preview_cosine_random-colors-per-beat-seed-123456789.mp4
+
+For the existing four-beat, 60 FPS example run:
+
+  RUN_DIR=generated/YY_MM_DD-HH_MM_SS \
+    bash src/run/create_gif_4_beats_60fps_random_colors.sh
+
 Useful video knobs:
 
   --run-dir generated/YY_MM_DD-HH_MM_SS
   --frame-subdir frames
   --beat-subdir diffusion_beats
   --video-subdir videos
-  --gif                      automatically writes videos/preview_<easing>.gif
+  --gif                      automatically writes a descriptive preview_*.gif name
   --easing logarithmic       labels the default output filename
   --output generated/YY_MM_DD-HH_MM_SS/videos/name.mp4
   --output generated/YY_MM_DD-HH_MM_SS/videos/name.gif
@@ -300,6 +351,9 @@ Useful video knobs:
   --bpm 120
   --color-0 111827           color for binary value 0, as RRGGBB or #RRGGBB
   --color-1 F97316           color for binary value 1, as RRGGBB or #RRGGBB
+  --random-colors-per-beat   choose new random colors for 0 and 1 at each beat
+  --random-colors            alias for --random-colors-per-beat
+  --color-seed 42            reproduce colors; generated and named if omitted
   --frames-per-beat 15
   --loop                     use when the frame generator was run with --loop
   --skip-beat-validation     use frame-dir directly as ordered sequence
@@ -309,6 +363,8 @@ Notes:
 
   - MP4/MOV/MKV/WebM/AVI output requires ffmpeg in PATH.
   - GIF output uses Pillow and has no audio.
+  - Automatic filenames include fixed colors or the random color seed. An
+    explicit --output path is used exactly as provided.
   - create_video_from_frames.py can detect whether the frame directory already
     contains the full sequence including beat images.
   - The current crossfade generator writes a full sequence including beat images.

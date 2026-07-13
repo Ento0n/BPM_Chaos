@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import sys
 from pathlib import Path
 
 import torch
@@ -22,6 +23,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "synthetic_bw_256"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "checkpoints" / "diffusion"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def configure_output_streams() -> None:
+    # Make progress prints visible when launched from shell scripts or task runners.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True)
 
 
 def get_default_accelerator() -> str:
@@ -283,6 +291,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_output_streams()
+
     # Make data splits and dataloader worker behavior reproducible.
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)

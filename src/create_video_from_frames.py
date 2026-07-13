@@ -1,7 +1,16 @@
+"""Assemble generated frames into GIF/video output with optional recoloring.
+
+Binary/grayscale source frames can keep their original colors, use one fixed
+0/1 color pair, or use a seeded random pair that changes exactly on each beat.
+Both GIF and ffmpeg output consume the same per-frame color plan.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
 import re
 import shutil
 import subprocess
@@ -31,6 +40,7 @@ DEFAULT_COLOR_0 = (0, 0, 0)
 DEFAULT_COLOR_1 = (255, 255, 255)
 RGBColor = tuple[int, int, int]
 ColorMap = tuple[RGBColor, RGBColor]
+FrameColorMaps = list[ColorMap]
 
 
 def natural_sort_key(path: Path) -> list[int | str]:
@@ -76,15 +86,45 @@ def safe_filename_token(value: str) -> str:
     return token.strip("-_.")
 
 
-def append_easing_to_name(path: Path, easing: str | None) -> Path:
-    if easing is None:
+def append_token_to_name(path: Path, value: str | None) -> Path:
+    """Append one normalized descriptor unless the filename already contains it."""
+    if value is None:
         return path
 
-    token = safe_filename_token(easing)
+    token = safe_filename_token(value)
     if not token or token in path.stem.lower().split("_"):
         return path
 
     return path.with_name(f"{path.stem}_{token}{path.suffix}")
+
+
+def append_easing_to_name(path: Path, easing: str | None) -> Path:
+    return append_token_to_name(path, easing)
+
+
+def append_color_settings_to_name(path: Path, args: argparse.Namespace) -> Path:
+    """Describe automatic colorization in a default output filename.
+
+    Random beat colors include the resolved seed, making every unseeded render
+    land at a unique path while keeping explicitly seeded renders reproducible.
+    Fixed palettes include both RGB endpoint colors. Uncolored output is left
+    unchanged.
+    """
+    if args.random_colors_per_beat:
+        return append_token_to_name(
+            path,
+            f"random-colors-per-beat-seed-{args.resolved_color_seed}",
+        )
+
+    if args.color_0 is None and args.color_1 is None:
+        return path
+
+    color_0 = args.color_0 or DEFAULT_COLOR_0
+    color_1 = args.color_1 or DEFAULT_COLOR_1
+    return append_token_to_name(
+        path,
+        f"colors-{format_hex_color(color_0)[1:]}-{format_hex_color(color_1)[1:]}",
+    )
 
 
 def default_output_name(gif: bool) -> str:
@@ -114,9 +154,9 @@ def format_hex_color(color: RGBColor) -> str:
 
 
 def frames_per_beat(fps: float, bpm: float) -> int:
-    if fps <= 0:
+    if not math.isfinite(fps) or fps <= 0:
         raise ValueError("--fps must be greater than 0.")
-    if bpm <= 0:
+    if not math.isfinite(bpm) or bpm <= 0:
         raise ValueError("--bpm must be greater than 0.")
     return max(1, int(round(fps * 60.0 / bpm)))
 
@@ -200,7 +240,13 @@ def symlink_or_copy(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
+# -----------------------------------------------------------------------------
+# Binary color mapping
+# -----------------------------------------------------------------------------
+
+
 def color_channel_lookup(zero_value: int, one_value: int) -> list[int]:
+    """Map every grayscale value to one channel between the 0 and 1 colors."""
     return [
         int(round(zero_value + (one_value - zero_value) * pixel / 255.0))
         for pixel in range(256)
@@ -208,6 +254,7 @@ def color_channel_lookup(zero_value: int, one_value: int) -> list[int]:
 
 
 def colorize_image(image: Image.Image, color_map: ColorMap) -> Image.Image:
+    """Map grayscale 0..255 to the selected binary endpoint colors."""
     color_0, color_1 = color_map
     grayscale = image.convert("L")
     channels = [
@@ -227,18 +274,70 @@ def save_colorized_frame(source: Path, destination: Path, color_map: ColorMap) -
         colorized.close()
 
 
+def random_rgb_color(generator: random.Random) -> RGBColor:
+    """Draw one RGB color without changing Python's process-wide random state."""
+    return (
+        generator.randrange(256),
+        generator.randrange(256),
+        generator.randrange(256),
+    )
+
+
+def build_random_frame_color_maps(
+    frame_count: int,
+    segment_frames: int,
+    loop: bool,
+    seed: int,
+) -> tuple[FrameColorMaps, list[ColorMap]]:
+    """Create one random binary palette per beat and assign it to each frame.
+
+    Beat anchors occur at frame indices 0, segment_frames, 2 * segment_frames,
+    and so on. A palette changes exactly at those indices and remains fixed for
+    the following transition frames. For a loop, the final duplicated anchor
+    uses beat 0's palette so both the image and its colors close seamlessly.
+    """
+    if frame_count < 1:
+        raise ValueError("At least one frame is required to create color maps.")
+    if segment_frames < 1:
+        raise ValueError("Frames per beat must be greater than 0.")
+
+    generator = random.Random(seed)
+    beat_color_maps: list[ColorMap] = []
+    frame_color_maps: FrameColorMaps = []
+
+    for frame_index in range(frame_count):
+        # A loop sequence ends with a duplicate of frame 0. Reusing its palette
+        # prevents a one-frame color flash at the GIF/video loop boundary.
+        if loop and frame_index > 0 and frame_index == frame_count - 1:
+            frame_color_maps.append(beat_color_maps[0])
+            continue
+
+        beat_index = frame_index // segment_frames
+        while len(beat_color_maps) <= beat_index:
+            beat_color_maps.append(
+                (random_rgb_color(generator), random_rgb_color(generator))
+            )
+        frame_color_maps.append(beat_color_maps[beat_index])
+
+    return frame_color_maps, beat_color_maps
+
+
 def create_ffmpeg_sequence(
     frame_paths: list[Path],
     sequence_dir: Path,
-    color_map: ColorMap | None,
+    color_maps: FrameColorMaps | None,
 ) -> str:
+    """Create ffmpeg's numbered input sequence, recoloring frames if requested."""
+    if color_maps is not None and len(color_maps) != len(frame_paths):
+        raise ValueError("Each rendered frame must have exactly one color map.")
+
     output_pattern = "frame_%06d.png"
     for index, frame_path in enumerate(frame_paths):
         output_path = sequence_dir / f"frame_{index:06d}.png"
-        if color_map is None:
+        if color_maps is None:
             symlink_or_copy(frame_path, output_path)
         else:
-            save_colorized_frame(frame_path, output_path, color_map)
+            save_colorized_frame(frame_path, output_path, color_maps[index])
     return output_pattern
 
 
@@ -248,7 +347,7 @@ def render_video_with_ffmpeg(
     fps: float,
     audio_path: Path | None,
     overwrite: bool,
-    color_map: ColorMap | None,
+    color_maps: FrameColorMaps | None,
 ) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
@@ -263,7 +362,7 @@ def render_video_with_ffmpeg(
 
     with tempfile.TemporaryDirectory(prefix="bpm_video_frames_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        input_pattern = create_ffmpeg_sequence(frame_paths, temp_dir, color_map)
+        input_pattern = create_ffmpeg_sequence(frame_paths, temp_dir, color_maps)
         command = [
             ffmpeg_path,
             "-y" if overwrite else "-n",
@@ -312,14 +411,23 @@ def render_gif(
     output_path: Path,
     fps: float,
     overwrite: bool,
-    color_map: ColorMap | None,
+    color_maps: FrameColorMaps | None,
 ) -> None:
+    if color_maps is not None and len(color_maps) != len(frame_paths):
+        raise ValueError("Each rendered frame must have exactly one color map.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"{output_path} already exists. Pass --overwrite to replace it.")
 
     duration_ms = max(1, int(round(1000.0 / fps)))
-    frames = [load_gif_frame(frame_path, color_map) for frame_path in frame_paths]
+    frames = [
+        load_gif_frame(
+            frame_path,
+            None if color_maps is None else color_maps[index],
+        )
+        for index, frame_path in enumerate(frame_paths)
+    ]
     first_frame = frames[0]
     remaining_frames = frames[1:]
 
@@ -342,13 +450,13 @@ def render_output(
     fps: float,
     audio_path: Path | None,
     overwrite: bool,
-    color_map: ColorMap | None,
+    color_maps: FrameColorMaps | None,
 ) -> None:
     suffix = output_path.suffix.lower()
     if suffix == ".gif":
         if audio_path is not None:
             raise ValueError("GIF output cannot include audio. Use an MP4 output instead.")
-        render_gif(frame_paths, output_path, fps, overwrite, color_map)
+        render_gif(frame_paths, output_path, fps, overwrite, color_maps)
         return
 
     if suffix in VIDEO_EXTENSIONS:
@@ -358,7 +466,7 @@ def render_output(
             fps,
             audio_path,
             overwrite,
-            color_map,
+            color_maps,
         )
         return
 
@@ -440,6 +548,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--random-colors-per-beat",
+        "--random-colors",
+        dest="random_colors_per_beat",
+        action="store_true",
+        help=(
+            "Choose new random colors for binary values 0 and 1 at every beat. "
+            "The pair changes on the beat and is held until the next beat."
+        ),
+    )
+    parser.add_argument(
+        "--color-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed for --random-colors-per-beat. If omitted, a random seed is "
+            "chosen, included in the automatic output filename, and printed "
+            "so the palette can be reproduced."
+        ),
+    )
+    parser.add_argument(
         "--frames-per-beat",
         type=int,
         default=None,
@@ -480,7 +608,11 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
         easing = args.easing or metadata_easing(frame_metadata)
         args.resolved_easing = easing
         default_output = DEFAULT_GIF_OUTPUT_PATH if args.gif else DEFAULT_OUTPUT_PATH
-        args.output = args.output or append_easing_to_name(default_output, easing)
+        if args.output is None:
+            args.output = append_color_settings_to_name(
+                append_easing_to_name(default_output, easing),
+                args,
+            )
         return
 
     frame_subdir = validate_relative_subdir(args.frame_subdir, "--frame-subdir")
@@ -493,7 +625,11 @@ def resolve_run_paths(args: argparse.Namespace) -> None:
     easing = args.easing or metadata_easing(frame_metadata, run_metadata)
     args.resolved_easing = easing
     default_output = args.run_dir / video_subdir / default_output_name(args.gif)
-    args.output = args.output or append_easing_to_name(default_output, easing)
+    if args.output is None:
+        args.output = append_color_settings_to_name(
+            append_easing_to_name(default_output, easing),
+            args,
+        )
 
 
 def validate_output_selection(args: argparse.Namespace) -> None:
@@ -501,6 +637,31 @@ def validate_output_selection(args: argparse.Namespace) -> None:
         raise ValueError("--gif requires a .gif output path or no --output.")
     if args.gif and args.audio is not None:
         raise ValueError("--gif cannot be used with --audio. GIF output has no audio.")
+
+
+def validate_color_options(args: argparse.Namespace) -> None:
+    """Reject color options whose combined meaning would be ambiguous."""
+    if args.random_colors_per_beat and (
+        args.color_0 is not None or args.color_1 is not None
+    ):
+        raise ValueError(
+            "--random-colors-per-beat cannot be combined with --color-0 or --color-1."
+        )
+    if args.color_seed is not None and not args.random_colors_per_beat:
+        raise ValueError("--color-seed requires --random-colors-per-beat.")
+
+
+def resolve_color_seed(args: argparse.Namespace) -> None:
+    """Resolve random color generation to a concrete, filename-safe seed."""
+    if not args.random_colors_per_beat:
+        args.resolved_color_seed = None
+        return
+
+    args.resolved_color_seed = (
+        args.color_seed
+        if args.color_seed is not None
+        else random.SystemRandom().getrandbits(64)
+    )
 
 
 def resolve_color_map(args: argparse.Namespace) -> ColorMap | None:
@@ -513,16 +674,52 @@ def resolve_color_map(args: argparse.Namespace) -> ColorMap | None:
     )
 
 
+def resolve_frame_color_maps(
+    args: argparse.Namespace,
+    frame_count: int,
+    segment_frames: int,
+) -> tuple[FrameColorMaps | None, list[ColorMap], int | None]:
+    """Resolve no coloring, one fixed palette, or a beat-indexed random plan."""
+    if args.random_colors_per_beat:
+        color_seed = args.resolved_color_seed
+        frame_color_maps, beat_color_maps = build_random_frame_color_maps(
+            frame_count=frame_count,
+            segment_frames=segment_frames,
+            loop=args.loop,
+            seed=color_seed,
+        )
+        return frame_color_maps, beat_color_maps, color_seed
+
+    color_map = resolve_color_map(args)
+    if color_map is None:
+        return None, [], None
+    return [color_map] * frame_count, [color_map], None
+
+
 def main() -> None:
     args = parse_args()
+    validate_color_options(args)
+    resolve_color_seed(args)
     resolve_run_paths(args)
     validate_output_selection(args)
-    segment_frames = args.frames_per_beat or frames_per_beat(args.fps, args.bpm)
+    # FPS controls both output timing and duration even when beat spacing is
+    # supplied directly, so it must always be a finite positive number.
+    if not math.isfinite(args.fps) or args.fps <= 0:
+        raise ValueError("--fps must be greater than 0.")
+    segment_frames = (
+        args.frames_per_beat
+        if args.frames_per_beat is not None
+        else frames_per_beat(args.fps, args.bpm)
+    )
     if segment_frames <= 0:
         raise ValueError("--frames-per-beat must be greater than 0.")
 
     frame_paths = collect_image_paths(args.frame_dir, args.frame_pattern)
-    beat_paths = [] if args.skip_beat_validation else collect_image_paths(args.beat_dir, args.beat_pattern)
+    beat_paths = (
+        []
+        if args.skip_beat_validation
+        else collect_image_paths(args.beat_dir, args.beat_pattern)
+    )
 
     sequence_paths, sequence_message = build_frame_sequence(
         frame_paths=frame_paths,
@@ -536,7 +733,11 @@ def main() -> None:
     if audio_path is not None and not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    color_map = resolve_color_map(args)
+    color_maps, beat_color_maps, color_seed = resolve_frame_color_maps(
+        args=args,
+        frame_count=len(sequence_paths),
+        segment_frames=segment_frames,
+    )
 
     render_output(
         frame_paths=sequence_paths,
@@ -544,7 +745,7 @@ def main() -> None:
         fps=args.fps,
         audio_path=audio_path,
         overwrite=args.overwrite,
-        color_map=color_map,
+        color_maps=color_maps,
     )
 
     duration_seconds = len(sequence_paths) / args.fps
@@ -554,9 +755,12 @@ def main() -> None:
     print(f"Frames per beat: {segment_frames}")
     print(f"Video frames: {len(sequence_paths)}")
     print(f"Frame size: {image_size[0]}x{image_size[1]}")
-    if color_map is not None:
-        print(f"Color 0: {format_hex_color(color_map[0])}")
-        print(f"Color 1: {format_hex_color(color_map[1])}")
+    if args.random_colors_per_beat:
+        print(f"Random color pairs: {len(beat_color_maps)} (one per beat)")
+        print(f"Color seed: {color_seed}")
+    elif beat_color_maps:
+        print(f"Color 0: {format_hex_color(beat_color_maps[0][0])}")
+        print(f"Color 1: {format_hex_color(beat_color_maps[0][1])}")
     if args.resolved_easing is not None:
         print(f"Easing label: {args.resolved_easing}")
     print(f"Duration at {args.fps:g} fps: {duration_seconds:.2f}s")
