@@ -1,9 +1,21 @@
+"""Generate diffusion frames from interpolated noise and optional model blends.
+
+The default path loads one fixed diffusion checkpoint and behaves as before.
+The opt-in ``random-binary`` model-alpha mode assigns alpha 0.00 or 1.00 to
+each beat, linearly schedules the in-between frames at 0.01 resolution, groups
+frames by alpha, and loads only one model checkpoint at a time for generation.
+"""
+
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import math
+import random
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +38,26 @@ from train_diffusion_model import (
 )
 
 from tqdm import tqdm
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL_ALPHA_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "mixed_diffusion"
+DEFAULT_MODEL_ALPHA_CHECKPOINT_PATTERN = (
+    "centered_geometric_wood_diagonals_alpha_{alpha:.2f}.ckpt"
+)
+MODEL_ALPHA_MODES = ("fixed", "random-binary")
+MODEL_ALPHA_QUANTIZATION = 0.01
+FrameSpec = tuple[int, int, float, int | None]
+
+
+@dataclass(frozen=True)
+class ModelAlphaPlan:
+    """Reproducible per-beat/per-frame model choices and resolved checkpoints."""
+
+    seed: int
+    beat_percents: tuple[int, ...]
+    frame_percents: tuple[int, ...]
+    checkpoint_paths: dict[int, Path]
 
 
 class DeviceSelectionError(RuntimeError):
@@ -257,8 +289,8 @@ def build_frame_specs(
     num_beats: int,
     segment_frames: int,
     loop: bool,
-) -> list[tuple[int, int, float, int | None]]:
-    frame_specs: list[tuple[int, int, float, int | None]] = []
+) -> list[FrameSpec]:
+    frame_specs: list[FrameSpec] = []
     segment_count = num_beats if loop else num_beats - 1
 
     for segment_index in range(segment_count):
@@ -276,9 +308,150 @@ def build_frame_specs(
     return frame_specs
 
 
+# =============================================================================
+# Random per-beat model-alpha planning
+# =============================================================================
+
+
+def build_random_binary_beat_alpha_percents(
+    num_beats: int,
+    seed: int,
+) -> tuple[int, ...]:
+    """Choose an independent, reproducible alpha endpoint for every beat."""
+    if num_beats < 1:
+        raise ValueError("num_beats must be at least 1 for model-alpha planning")
+
+    # A local RNG keeps model selection reproducible without changing Python's
+    # global random state or the separate torch generator used for noise anchors.
+    rng = random.Random(seed)
+    return tuple(rng.choice((0, 100)) for _ in range(num_beats))
+
+
+def build_frame_alpha_percents(
+    frame_specs: list[FrameSpec],
+    beat_percents: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Linearly interpolate beat alphas and quantize to the nearest percent."""
+    if not beat_percents:
+        raise ValueError("At least one beat alpha is required")
+    if any(percent not in {0, 100} for percent in beat_percents):
+        raise ValueError("Random-binary beat alphas must be either 0 or 100")
+
+    frame_percents: list[int] = []
+    for start_index, end_index, raw_t, _ in frame_specs:
+        if start_index >= len(beat_percents) or end_index >= len(beat_percents):
+            raise ValueError("Frame specification refers to a missing beat alpha")
+
+        # Model blending intentionally uses raw linear frame progress. Noise
+        # interpolation still uses --easing independently in make_frame_noise_batch.
+        start_percent = beat_percents[start_index]
+        end_percent = beat_percents[end_index]
+        raw_percent = start_percent + (end_percent - start_percent) * raw_t
+
+        # Alpha values are non-negative, so floor(x + 0.5) implements explicit
+        # half-up rounding without Python's banker-rounding behavior at ties.
+        quantized_percent = int(math.floor(raw_percent + 0.5))
+        frame_percents.append(min(100, max(0, quantized_percent)))
+
+    return tuple(frame_percents)
+
+
+def resolve_model_alpha_checkpoints(
+    required_percents: tuple[int, ...],
+    checkpoint_dir: Path,
+    checkpoint_pattern: str,
+) -> dict[int, Path]:
+    """Resolve every required alpha checkpoint before any run output is created."""
+    checkpoint_dir = checkpoint_dir.expanduser().resolve()
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(
+            f"Model-alpha checkpoint directory does not exist: {checkpoint_dir}"
+        )
+
+    checkpoint_paths: dict[int, Path] = {}
+    resolved_paths: set[Path] = set()
+    for percent in sorted(set(required_percents)):
+        if not 0 <= percent <= 100:
+            raise ValueError(f"Model alpha percent must be between 0 and 100: {percent}")
+        try:
+            filename = checkpoint_pattern.format(
+                alpha=percent / 100,
+                percent=percent,
+            )
+        except (IndexError, KeyError, ValueError) as error:
+            raise ValueError(
+                "--model-alpha-checkpoint-pattern must support "
+                "{alpha} and/or {percent} formatting"
+            ) from error
+
+        # Keep the pattern to one filename inside the selected directory. This
+        # makes the preflight target obvious and prevents accidental traversal.
+        if not filename or Path(filename).name != filename:
+            raise ValueError(
+                "--model-alpha-checkpoint-pattern must produce a single filename"
+            )
+        checkpoint_path = checkpoint_dir / filename
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Missing checkpoint for alpha={percent / 100:.2f}: {checkpoint_path}"
+            )
+        if checkpoint_path in resolved_paths:
+            raise ValueError(
+                "--model-alpha-checkpoint-pattern produced the same file for "
+                "multiple alpha values"
+            )
+        checkpoint_paths[percent] = checkpoint_path
+        resolved_paths.add(checkpoint_path)
+
+    return checkpoint_paths
+
+
+def build_random_binary_model_alpha_plan(
+    num_beats: int,
+    frame_specs: list[FrameSpec],
+    seed: int,
+    checkpoint_dir: Path,
+    checkpoint_pattern: str,
+) -> ModelAlphaPlan:
+    """Build the complete random-binary schedule and preflight its checkpoints."""
+    beat_percents = build_random_binary_beat_alpha_percents(num_beats, seed)
+    frame_percents = build_frame_alpha_percents(frame_specs, beat_percents)
+    checkpoint_paths = resolve_model_alpha_checkpoints(
+        required_percents=frame_percents,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_pattern=checkpoint_pattern,
+    )
+    return ModelAlphaPlan(
+        seed=seed,
+        beat_percents=beat_percents,
+        frame_percents=frame_percents,
+        checkpoint_paths=checkpoint_paths,
+    )
+
+
+def group_frame_indices_by_alpha(
+    frame_percents: tuple[int, ...],
+) -> dict[int, list[int]]:
+    """Group original frame indices so each alpha model is loaded only once."""
+    grouped_indices: dict[int, list[int]] = {}
+    for frame_index, percent in enumerate(frame_percents):
+        grouped_indices.setdefault(percent, []).append(frame_index)
+    return grouped_indices
+
+
+def saved_frame_alpha_percents(
+    model_alpha_plan: ModelAlphaPlan,
+    loop: bool,
+) -> tuple[int, ...]:
+    """Return metadata alphas, including the copied loop-closing frame."""
+    if loop:
+        return model_alpha_plan.frame_percents + (model_alpha_plan.beat_percents[0],)
+    return model_alpha_plan.frame_percents
+
+
 def make_frame_noise_batch(
     anchor_noises: torch.Tensor,
-    frame_specs: list[tuple[int, int, float, int | None]],
+    frame_specs: list[FrameSpec],
     interpolation: str,
     easing: str,
 ) -> torch.Tensor:
@@ -297,12 +470,18 @@ def make_frame_noise_batch(
 
 
 def save_metadata(
-    checkpoint_path: Path,
+    checkpoint_path: Path | None,
+    model_alpha_plan: ModelAlphaPlan | None,
     args: argparse.Namespace,
     segment_frames: int,
     frame_count: int,
     beat_count: int,
 ) -> None:
+    saved_alpha_percents = (
+        saved_frame_alpha_percents(model_alpha_plan, args.loop)
+        if model_alpha_plan is not None
+        else ()
+    )
     metadata = {
         "run_id": args.run_id,
         "run_parent_dir": str(args.run_parent_dir),
@@ -313,7 +492,48 @@ def save_metadata(
         "run_finished_at": args.run_finished_at,
         "generation_elapsed_seconds": args.generation_elapsed_seconds,
         "generation_elapsed": args.generation_elapsed,
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+        "model_alpha_mode": args.model_alpha_mode,
+        "model_alpha_seed": (
+            model_alpha_plan.seed if model_alpha_plan is not None else None
+        ),
+        "model_alpha_beat_values": (
+            [percent / 100 for percent in model_alpha_plan.beat_percents]
+            if model_alpha_plan is not None
+            else None
+        ),
+        "model_alpha_frame_values": (
+            [percent / 100 for percent in saved_alpha_percents]
+            if model_alpha_plan is not None
+            else None
+        ),
+        "model_alpha_interpolation": (
+            "linear" if model_alpha_plan is not None else None
+        ),
+        "model_alpha_uses_noise_easing": (
+            False if model_alpha_plan is not None else None
+        ),
+        "model_alpha_checkpoint_step": (
+            MODEL_ALPHA_QUANTIZATION if model_alpha_plan is not None else None
+        ),
+        "model_alpha_checkpoint_dir": (
+            str(args.model_alpha_checkpoint_dir)
+            if model_alpha_plan is not None
+            else None
+        ),
+        "model_alpha_checkpoint_pattern": (
+            args.model_alpha_checkpoint_pattern
+            if model_alpha_plan is not None
+            else None
+        ),
+        "model_alpha_checkpoints": (
+            {
+                f"{percent / 100:.2f}": str(path)
+                for percent, path in model_alpha_plan.checkpoint_paths.items()
+            }
+            if model_alpha_plan is not None
+            else None
+        ),
         "output_parent_dir": str(args.run_parent_dir),
         "output_dir": str(args.output_dir),
         "beat_output_parent_dir": None if args.no_save_beats else str(args.run_parent_dir),
@@ -340,8 +560,89 @@ def save_metadata(
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def generate_diffusion_interpolation_frames(
+def load_diffusion_module(
     checkpoint_path: Path,
+    image_size: int,
+    device: torch.device,
+) -> tuple[DiffusionModule, torch.device]:
+    """Load one checkpoint on CPU, then move only that model to the target device."""
+    diffusion_module = DiffusionModule.load_from_checkpoint(
+        checkpoint_path,
+        learning_rate=1e-4,
+        use_gradient_checkpointing=False,
+        image_size=image_size,
+        map_location=torch.device("cpu"),
+    )
+    diffusion_module.eval()
+    diffusion_module.to(device)
+    parameter_device = validate_model_device(diffusion_module, device)
+    return diffusion_module, parameter_device
+
+
+def clear_device_cache(device: torch.device) -> None:
+    """Release cached accelerator memory before loading the next alpha model."""
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def generate_indexed_frame_batches(
+    frame_indices: list[int],
+    frame_specs: list[FrameSpec],
+    anchor_noises: torch.Tensor,
+    diffusion_module: DiffusionModule,
+    scheduler: DDIMScheduler | DDPMScheduler,
+    output_dir: Path,
+    beat_output_dir: Path | None,
+    interpolation: str,
+    easing: str,
+    batch_size: int,
+    device: torch.device,
+    ddim_eta: float,
+    progress,
+) -> int:
+    """Generate arbitrary timeline indices and save them under original filenames."""
+    beat_count = 0
+    for batch_start in range(0, len(frame_indices), batch_size):
+        batch_indices = frame_indices[batch_start : batch_start + batch_size]
+        batch_specs = [frame_specs[index] for index in batch_indices]
+        batch_noise = make_frame_noise_batch(
+            anchor_noises=anchor_noises,
+            frame_specs=batch_specs,
+            interpolation=interpolation,
+            easing=easing,
+        )
+        batch_images = denoise_batch(
+            diffusion_module=diffusion_module,
+            scheduler=scheduler,
+            initial_noise=batch_noise,
+            device=device,
+            eta=ddim_eta,
+            progress=progress,
+        )
+
+        # Generation may be grouped by model alpha rather than timeline order.
+        # Original indices keep filenames sortable into the intended animation.
+        for batch_offset, image_tensor in enumerate(batch_images):
+            frame_index = batch_indices[batch_offset]
+            output_path = output_dir / f"frame_{frame_index:06d}.png"
+            save_image(image_tensor, output_path)
+
+            beat_index = batch_specs[batch_offset][3]
+            if beat_index is not None and beat_output_dir is not None:
+                beat_path = beat_output_dir / f"sample_{beat_index:03d}.png"
+                save_image(image_tensor, beat_path)
+                beat_count += 1
+
+        del batch_images, batch_noise
+
+    return beat_count
+
+
+def generate_diffusion_interpolation_frames(
+    checkpoint_path: Path | None,
     output_dir: Path,
     beat_output_dir: Path | None,
     image_size: int,
@@ -359,25 +660,20 @@ def generate_diffusion_interpolation_frames(
     loop: bool,
     required_device: str | None,
     show_progress: bool,
+    model_alpha_plan: ModelAlphaPlan | None = None,
 ) -> tuple[int, int, torch.device, torch.device]:
-    device = resolve_device(accelerator, required_device)
+    if (checkpoint_path is None) == (model_alpha_plan is None):
+        raise ValueError(
+            "Generation requires either one fixed checkpoint or one model-alpha plan"
+        )
 
+    device = resolve_device(accelerator, required_device)
     print(f"Using {device} as device!")
 
-    diffusion_module = DiffusionModule.load_from_checkpoint(
-        checkpoint_path,
-        learning_rate=1e-4,
-        use_gradient_checkpointing=False,
-        image_size=image_size,
-        map_location=device,
-    )
-
-    print(f"Using checkpoint from {checkpoint_path}!")
-
-    diffusion_module.eval()
-    diffusion_module.to(device)
-    parameter_device = validate_model_device(diffusion_module, device)
-
+    # Anchor noise uses its own CPU generator below. Seed torch's global device
+    # generators too so DDPM variance noise and DDIM eta > 0 remain repeatable
+    # for the same frame grouping, batch size, and command-line seed.
+    torch.manual_seed(seed)
     scheduler = create_scheduler(scheduler_name, num_train_timesteps)
     set_scheduler_timesteps(scheduler, num_inference_steps, device)
 
@@ -386,6 +682,15 @@ def generate_diffusion_interpolation_frames(
     generated_frame_count = len(frame_specs)
     frame_count = generated_frame_count
     beat_count = 0
+    parameter_device: torch.device | None = None
+
+    if (
+        model_alpha_plan is not None
+        and len(model_alpha_plan.frame_percents) != generated_frame_count
+    ):
+        raise ValueError(
+            "Model-alpha frame schedule length does not match generated frame count"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if beat_output_dir is not None:
@@ -399,33 +704,70 @@ def generate_diffusion_interpolation_frames(
     )
 
     try:
-        for batch_start in range(0, generated_frame_count, batch_size):
-            batch_specs = frame_specs[batch_start : batch_start + batch_size]
-            batch_noise = make_frame_noise_batch(
-                anchor_noises=anchor_noises,
-                frame_specs=batch_specs,
-                interpolation=interpolation,
-                easing=easing,
-            )
-            batch_images = denoise_batch(
-                diffusion_module=diffusion_module,
-                scheduler=scheduler,
-                initial_noise=batch_noise,
+        if model_alpha_plan is None:
+            assert checkpoint_path is not None
+            print(f"Using checkpoint from {checkpoint_path}!")
+            diffusion_module, parameter_device = load_diffusion_module(
+                checkpoint_path=checkpoint_path,
+                image_size=image_size,
                 device=device,
-                eta=ddim_eta,
-                progress=progress,
             )
-
-            for batch_offset, image_tensor in enumerate(batch_images):
-                frame_index = batch_start + batch_offset
-                output_path = output_dir / f"frame_{frame_index:06d}.png"
-                save_image(image_tensor, output_path)
-
-                beat_index = batch_specs[batch_offset][3]
-                if beat_index is not None and beat_output_dir is not None:
-                    beat_path = beat_output_dir / f"sample_{beat_index:03d}.png"
-                    save_image(image_tensor, beat_path)
-                    beat_count += 1
+            try:
+                beat_count += generate_indexed_frame_batches(
+                    frame_indices=list(range(generated_frame_count)),
+                    frame_specs=frame_specs,
+                    anchor_noises=anchor_noises,
+                    diffusion_module=diffusion_module,
+                    scheduler=scheduler,
+                    output_dir=output_dir,
+                    beat_output_dir=beat_output_dir,
+                    interpolation=interpolation,
+                    easing=easing,
+                    batch_size=batch_size,
+                    device=device,
+                    ddim_eta=ddim_eta,
+                    progress=progress,
+                )
+            finally:
+                diffusion_module.to(torch.device("cpu"))
+                del diffusion_module
+                clear_device_cache(device)
+        else:
+            grouped_indices = group_frame_indices_by_alpha(
+                model_alpha_plan.frame_percents
+            )
+            for percent in sorted(grouped_indices):
+                alpha_checkpoint_path = model_alpha_plan.checkpoint_paths[percent]
+                frame_indices = grouped_indices[percent]
+                print(
+                    f"Using alpha={percent / 100:.2f} checkpoint "
+                    f"for {len(frame_indices)} frame(s): {alpha_checkpoint_path}"
+                )
+                diffusion_module, parameter_device = load_diffusion_module(
+                    checkpoint_path=alpha_checkpoint_path,
+                    image_size=image_size,
+                    device=device,
+                )
+                try:
+                    beat_count += generate_indexed_frame_batches(
+                        frame_indices=frame_indices,
+                        frame_specs=frame_specs,
+                        anchor_noises=anchor_noises,
+                        diffusion_module=diffusion_module,
+                        scheduler=scheduler,
+                        output_dir=output_dir,
+                        beat_output_dir=beat_output_dir,
+                        interpolation=interpolation,
+                        easing=easing,
+                        batch_size=batch_size,
+                        device=device,
+                        ddim_eta=ddim_eta,
+                        progress=progress,
+                    )
+                finally:
+                    diffusion_module.to(torch.device("cpu"))
+                    del diffusion_module
+                    clear_device_cache(device)
     finally:
         if progress is not None:
             progress.close()
@@ -435,6 +777,8 @@ def generate_diffusion_interpolation_frames(
         shutil.copy2(output_dir / "frame_000000.png", closing_frame_path)
         frame_count += 1
 
+    if parameter_device is None:
+        raise RuntimeError("No diffusion model was loaded for generation")
     return frame_count, beat_count, device, parameter_device
 
 
@@ -449,7 +793,20 @@ def normalize_required_device(
     return require_device
 
 
-def parse_args() -> argparse.Namespace:
+def validate_model_alpha_options(args: argparse.Namespace) -> None:
+    """Reject option combinations whose checkpoint source would be ambiguous."""
+    if args.model_alpha_mode == "random-binary" and args.checkpoint is not None:
+        raise ValueError(
+            "--checkpoint cannot be used with --model-alpha-mode random-binary; "
+            "models come from --model-alpha-checkpoint-dir"
+        )
+    if args.model_alpha_mode == "fixed" and args.model_alpha_seed is not None:
+        raise ValueError(
+            "--model-alpha-seed requires --model-alpha-mode random-binary"
+        )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate beat and in-between frames by interpolating diffusion "
@@ -458,6 +815,39 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--model-alpha-mode",
+        choices=MODEL_ALPHA_MODES,
+        default="fixed",
+        help=(
+            "fixed uses one --checkpoint as before; random-binary assigns "
+            "alpha 0.00 or 1.00 to each beat and blends models between beats."
+        ),
+    )
+    parser.add_argument(
+        "--model-alpha-seed",
+        type=int,
+        default=None,
+        help=(
+            "Random beat-model seed for random-binary mode. "
+            "Defaults to --seed."
+        ),
+    )
+    parser.add_argument(
+        "--model-alpha-checkpoint-dir",
+        type=Path,
+        default=DEFAULT_MODEL_ALPHA_CHECKPOINT_DIR,
+        help="Directory containing the alpha checkpoints used by random-binary mode.",
+    )
+    parser.add_argument(
+        "--model-alpha-checkpoint-pattern",
+        type=str,
+        default=DEFAULT_MODEL_ALPHA_CHECKPOINT_PATTERN,
+        help=(
+            "Filename format inside --model-alpha-checkpoint-dir. "
+            "Available fields: {alpha} in [0,1] and {percent} in [0,100]."
+        ),
+    )
     parser.add_argument(
         "--run-parent-dir",
         type=Path,
@@ -554,7 +944,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the denoising progress bar.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -570,17 +960,45 @@ def main() -> None:
         raise ValueError("--num-inference-steps must be greater than 0.")
     if args.num_train_timesteps <= 0:
         raise ValueError("--num-train-timesteps must be greater than 0.")
+    validate_model_alpha_options(args)
 
     segment_frames = args.frames_per_beat or frames_per_beat(args.fps, args.bpm)
     if segment_frames <= 0:
         raise ValueError("--frames-per-beat must be greater than 0.")
 
     args.require_device = normalize_required_device(args.require_device, args.require_mps)
-    checkpoint_path = args.checkpoint or find_checkpoint(args.checkpoint_dir)
     try:
         resolve_device(args.accelerator, args.require_device)
     except DeviceSelectionError as error:
         raise SystemExit(f"Error: {error}") from error
+
+    # Resolve every required input before creating a timestamped output folder.
+    # A missing alpha checkpoint therefore fails without leaving a partial run.
+    model_alpha_plan: ModelAlphaPlan | None = None
+    checkpoint_path: Path | None = None
+    if args.model_alpha_mode == "fixed":
+        checkpoint_path = args.checkpoint or find_checkpoint(args.checkpoint_dir)
+    else:
+        model_alpha_seed = (
+            args.model_alpha_seed
+            if args.model_alpha_seed is not None
+            else args.seed
+        )
+        args.model_alpha_checkpoint_dir = (
+            args.model_alpha_checkpoint_dir.expanduser().resolve()
+        )
+        planned_frame_specs = build_frame_specs(
+            num_beats=args.num_beats,
+            segment_frames=segment_frames,
+            loop=args.loop,
+        )
+        model_alpha_plan = build_random_binary_model_alpha_plan(
+            num_beats=args.num_beats,
+            frame_specs=planned_frame_specs,
+            seed=model_alpha_seed,
+            checkpoint_dir=args.model_alpha_checkpoint_dir,
+            checkpoint_pattern=args.model_alpha_checkpoint_pattern,
+        )
 
     run_parent_dir = args.output_dir or args.run_parent_dir
     beat_subdir = None if args.no_save_beats else args.beat_subdir
@@ -604,6 +1022,7 @@ def main() -> None:
         frame_count, beat_count, resolved_device, parameter_device = (
             generate_diffusion_interpolation_frames(
                 checkpoint_path=checkpoint_path,
+                model_alpha_plan=model_alpha_plan,
                 output_dir=args.output_dir,
                 beat_output_dir=beat_output_dir,
                 image_size=args.image_size,
@@ -637,6 +1056,7 @@ def main() -> None:
 
     save_metadata(
         checkpoint_path=checkpoint_path,
+        model_alpha_plan=model_alpha_plan,
         args=args,
         segment_frames=segment_frames,
         frame_count=frame_count,
@@ -646,7 +1066,19 @@ def main() -> None:
     duration_seconds = frame_count / args.fps
     print(f"Run id: {run_id}")
     print(f"Run folder: {run_dir}")
-    print(f"Loaded checkpoint: {checkpoint_path}")
+    if model_alpha_plan is None:
+        print(f"Loaded checkpoint: {checkpoint_path}")
+    else:
+        beat_alpha_text = ", ".join(
+            f"{percent / 100:.2f}" for percent in model_alpha_plan.beat_percents
+        )
+        print("Model alpha mode: random-binary")
+        print(f"Model alpha seed: {model_alpha_plan.seed}")
+        print(f"Beat model alphas: {beat_alpha_text}")
+        print(
+            "Unique model alpha checkpoints used: "
+            f"{len(model_alpha_plan.checkpoint_paths)}"
+        )
     print(f"Requested accelerator: {args.accelerator}")
     print(f"Resolved torch device: {resolved_device}")
     print(f"Model parameter device: {parameter_device}")

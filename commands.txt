@@ -179,6 +179,29 @@ Diffusion noise interpolation:
     --seed 42 \
     --overwrite
 
+Random binary model-alpha interpolation:
+
+  This mode independently assigns alpha 0.00 or 1.00 to every beat. Frames
+  between beats use the nearest 0.01 alpha checkpoint on a linear model-alpha
+  schedule. Noise interpolation still follows --interpolation and --easing.
+
+  conda run -n bpm_chaos python src/generate_diffusion_interpolation_frames.py \
+    --model-alpha-mode random-binary \
+    --model-alpha-checkpoint-dir checkpoints/mixed_diffusion \
+    --model-alpha-seed 42 \
+    --run-parent-dir generated \
+    --num-beats 10 \
+    --image-size 256 \
+    --fps 30 \
+    --bpm 91 \
+    --num-inference-steps 100 \
+    --scheduler ddim \
+    --interpolation slerp \
+    --easing logarithmic \
+    --accelerator mps \
+    --require-device mps \
+    --seed 42
+
 For 120 BPM at 30 FPS:
 
   frames_per_beat = round(30 * 60 / 120) = 15
@@ -225,6 +248,11 @@ Diffusion-interpolation-specific knobs:
 
   --checkpoint-dir checkpoints/diffusion
   --checkpoint checkpoints/diffusion/name.ckpt
+  --model-alpha-mode fixed           use the single checkpoint path above
+  --model-alpha-mode random-binary   randomly choose alpha 0.00/1.00 per beat
+  --model-alpha-seed 42              defaults to --seed when omitted
+  --model-alpha-checkpoint-dir checkpoints/mixed_diffusion
+  --model-alpha-checkpoint-pattern centered_geometric_wood_diagonals_alpha_{alpha:.2f}.ckpt
   --run-parent-dir generated
   --frame-subdir frames
   --beat-subdir diffusion_beats
